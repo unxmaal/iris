@@ -6,7 +6,7 @@ use std::io::Write as IoWrite;
 use crate::devlog::{LogModule, devlog_mask};
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, BusDevice, Device, DmaClient, DmaStatus, Resettable, Saveable};
 use crate::snapshot::{get_field, u32_slice_to_toml, load_u32_slice, toml_u32, toml_bool, hex_u32};
-use crate::config::NfsConfig;
+use crate::config::NetworkConfig;
 use crate::eeprom_93c56::Eeprom93c56;
 use crate::ioc::Ioc;
 use crate::ds1x86::Ds1x86;
@@ -223,13 +223,18 @@ struct Hpc3Irq {
     ioc: Ioc,
     bit: u32,
     ioc_line: IocInterrupt,
+    /// For SCSI chip-IRQ wirings: the paired PDMA channel + its DMA-side
+    /// intstat bit, so that a chip-INT ack also drops the PDMA half of the
+    /// shared SCSI INT3 line.  None for callbacks that don't have a paired
+    /// PDMA channel (e.g. PDMA-side Hpc3Irq, ethernet, …).
+    pdma_paired: Option<(Arc<Mutex<PdmaChannel>>, u32)>,
 }
 
 impl Hpc3Irq {
     fn update(&self, level: bool) {
         let mut state = self.state.lock();
         if level { state.intstat |= self.bit; } else { state.intstat &= !self.bit; }
-        
+
         // Determine IOC line state based on all contributors
         let active = match self.ioc_line {
             IocInterrupt::Scsi0 => (state.intstat & (HPC3_INTSTAT_SCSI0_DEV | HPC3_INTSTAT_SCSI0_DMA)) != 0,
@@ -245,6 +250,33 @@ impl Hpc3Irq {
 impl ScsiCallback for Hpc3Irq {
     fn set_interrupt(&self, level: bool) {
         self.update(level);
+    }
+    fn clear_pdma_int(&self) {
+        // Called when the kernel acks the chip-side INT via SCSI_STATUS read.
+        // Drop any pending PDMA DMA-completion bit on the same SCSI line —
+        // on real HPC3 the SCSI INT3 source is shared and the chip ack settles
+        // both halves.  Without this, intstat[SCSI*_DMA] stays asserted forever
+        // when the IRIX miniroot's SCSI driver only acks via the chip path.
+        if let Some((chan, dma_bit)) = &self.pdma_paired {
+            let mut c = chan.lock();
+            if c.ctrl & PDMA_CTRL_INT != 0 {
+                c.ctrl &= !PDMA_CTRL_INT;
+            }
+            drop(c);
+            let mut st = self.state.lock();
+            st.intstat &= !*dma_bit;
+            // Recompute IOC line: chip already deasserted via set_interrupt(false),
+            // and now the DMA half is too, so SCSI0 line drops to 0.
+            let active = (st.intstat & (HPC3_INTSTAT_SCSI0_DEV | HPC3_INTSTAT_SCSI0_DMA
+                                       | HPC3_INTSTAT_SCSI1_DEV | HPC3_INTSTAT_SCSI1_DMA))
+                         & match self.ioc_line {
+                             IocInterrupt::Scsi0 => HPC3_INTSTAT_SCSI0_DEV | HPC3_INTSTAT_SCSI0_DMA,
+                             IocInterrupt::Scsi1 => HPC3_INTSTAT_SCSI1_DEV | HPC3_INTSTAT_SCSI1_DMA,
+                             _ => 0,
+                         };
+            drop(st);
+            self.ioc.set_interrupt(self.ioc_line, active != 0);
+        }
     }
 }
 
@@ -759,13 +791,11 @@ impl PdmaChannelOps for ScsiDmaOps {
                 if (val & SCSI_CTRL_FLUSH) != 0 {
                     // Flush: drain FIFO to memory and terminate DMA.
                     // In emulation the FIFO doesn't exist, so just stop the channel.
-                    // Raise DMA interrupt if XIE is set in the current descriptor.
-                    if chan.xie {
-                        chan.ctrl |= PDMA_CTRL_INT;
-                        if let Some(cb) = &chan.callback {
-                            cb.set_dma_interrupt(true);
-                        }
-                    }
+                    // NOTE: previously we raised PDMA_CTRL_INT here if XIE was set
+                    // in the current descriptor, but the IRIX 6.5 miniroot SCSI
+                    // driver doesn't expect an IRQ from its own FLUSH (teardown)
+                    // — it acks the prior real IRQ and writes FLUSH to clean up.
+                    // Firing again on FLUSH leaves the bit stuck → IRQ storm.
                     chan.set_active(false);
                     chan.ctrl &= !(SCSI_CTRL_ACTIVE | SCSI_CTRL_FLUSH);
                 }
@@ -966,11 +996,18 @@ pub struct Hpc3 {
 
 impl Hpc3 {
     pub fn new(eeprom: Arc<Mutex<Eeprom93c56>>, ioc: Ioc, guinness: bool, heartbeat: Arc<AtomicU64>) -> Self {
-        Self::with_nfs(eeprom, ioc, guinness, heartbeat, None, vec![], false)
+        Self::with_net(eeprom, ioc, guinness, heartbeat, NetworkConfig::default(), false, "nvram.bin".to_string())
     }
 
-    pub fn with_nfs(eeprom: Arc<Mutex<Eeprom93c56>>, ioc: Ioc, guinness: bool, heartbeat: Arc<AtomicU64>, nfs: Option<NfsConfig>, port_forwards: Vec<crate::config::PortForwardConfig>, headless: bool) -> Self {
-        let rtc = Arc::new(Ds1x86::new(8192));
+    /// `no_audio` skips HAL2 audio init (used by `--noaudio` and also by full
+    /// `--headless`, which can't run audio in CI).
+    /// `nvram_path` is the on-disk NVRAM file (loaded at startup, default save
+    /// target for `iris-ci rtc-save`).
+    pub fn with_net(eeprom: Arc<Mutex<Eeprom93c56>>, ioc: Ioc, guinness: bool, heartbeat: Arc<AtomicU64>, net: NetworkConfig, no_audio: bool, nvram_path: String) -> Self {
+        let nfs = net.nfs;
+        let port_forwards = net.port_forward;
+        let subnet = net.nat_subnet.unwrap_or_default();
+        let rtc = Arc::new(Ds1x86::new(8192, nvram_path));
         let pdma_dump = Arc::new(AtomicU32::new(0));
         
         let state = Arc::new(Mutex::new(Hpc3State {
@@ -998,11 +1035,13 @@ impl Hpc3 {
             // Setup DMA interrupts
             if i == HPC3_PDMA_CHAN_SCSI0 as usize {
                 chan.callback = Some(Arc::new(Hpc3Irq {
-                    state: state.clone(), ioc: ioc.clone(), bit: HPC3_INTSTAT_SCSI0_DMA, ioc_line: IocInterrupt::Scsi0
+                    state: state.clone(), ioc: ioc.clone(), bit: HPC3_INTSTAT_SCSI0_DMA, ioc_line: IocInterrupt::Scsi0,
+                    pdma_paired: None,  // PDMA-side: doesn't itself need to clear another PDMA
                 }));
             } else if i == HPC3_PDMA_CHAN_SCSI1 as usize {
                 chan.callback = Some(Arc::new(Hpc3Irq {
-                    state: state.clone(), ioc: ioc.clone(), bit: HPC3_INTSTAT_SCSI1_DMA, ioc_line: IocInterrupt::Scsi1
+                    state: state.clone(), ioc: ioc.clone(), bit: HPC3_INTSTAT_SCSI1_DMA, ioc_line: IocInterrupt::Scsi1,
+                    pdma_paired: None,
                 }));
             }
             // Enet channels 10/11: no DMA completion callback — interrupt is driven by SEEQ via EnetSeeqIrq
@@ -1026,19 +1065,29 @@ impl Hpc3 {
             hpc3_state: state.clone(),
             ioc:        ioc.clone(),
         });
-        let gateway_cfg = GatewayConfig { nfs, port_forwards, ..GatewayConfig::default() };
+        let gateway_cfg = GatewayConfig {
+            nfs,
+            port_forwards,
+            gateway_ip: subnet.gateway_ip,
+            client_ip:  subnet.client_ip,
+            netmask:    subnet.netmask,
+            ..GatewayConfig::default()
+        };
         let seeq = Arc::new(Seeq8003::with_config(Some(seeq_irq), Some(enet_rx_dma), Some(enet_tx_dma), gateway_cfg, heartbeat.clone()));
         // Publish seeq to both the DMA ops (CTRL reads) and the irq (status checks in set_interrupt)
         let _ = enet_seeq_lock.set(seeq.clone());
         
         let scsi0_dma = Arc::new(PdmaClientImpl { channel: pdma_channels[8].clone() });
         let scsi0_irq = Arc::new(Hpc3Irq {
-            state: state.clone(), ioc: ioc.clone(), bit: HPC3_INTSTAT_SCSI0_DEV, ioc_line: IocInterrupt::Scsi0
+            state: state.clone(), ioc: ioc.clone(), bit: HPC3_INTSTAT_SCSI0_DEV, ioc_line: IocInterrupt::Scsi0,
+            // Pair the chip-IRQ with the SCSI0 PDMA channel so a chip-INT ack
+            // (kernel reads SCSI_STATUS) also drops any lingering PDMA INT.
+            pdma_paired: Some((pdma_channels[8].clone(), HPC3_INTSTAT_SCSI0_DMA)),
         });
 
         let scsi_dev = Arc::new(Wd33c93a::new(Some(scsi0_dma), Some(scsi0_irq), heartbeat.clone()));
         
-        let hal2 = if headless { None } else { Some(Arc::new(Hal2::new(dma_clients[0..8].to_vec()))) };
+        let hal2 = if no_audio { None } else { Some(Arc::new(Hal2::new(dma_clients[0..8].to_vec()))) };
 
         Self {
             state,
@@ -1156,7 +1205,27 @@ impl Device for Hpc3 {
 
     fn execute_command(&self, cmd: &str, args: &[&str], mut writer: Box<dyn IoWrite + Send>) -> Result<(), String> {
         if cmd == "hpc3" {
-            return Err("Usage: hpc3 status".to_string());
+            if args.first().copied() != Some("status") {
+                return Err("Usage: hpc3 status".to_string());
+            }
+            let s = self.state.lock();
+            let intstat_names: &[(u32, &str)] = &[
+                (HPC3_INTSTAT_SCSI0_DEV, "SCSI0_DEV"),
+                (HPC3_INTSTAT_SCSI0_DMA, "SCSI0_DMA"),
+                (HPC3_INTSTAT_SCSI1_DEV, "SCSI1_DEV"),
+                (HPC3_INTSTAT_SCSI1_DMA, "SCSI1_DMA"),
+                (HPC3_INTSTAT_ENET_DEV,  "ENET_DEV"),
+                (HPC3_INTSTAT_ENET_RX_DMA, "ENET_RX_DMA"),
+                (HPC3_INTSTAT_ENET_TX_DMA, "ENET_TX_DMA"),
+            ];
+            let mut names = Vec::new();
+            for (b, n) in intstat_names { if s.intstat & b != 0 { names.push(*n); } }
+            let names_s = if names.is_empty() { "-".into() } else { names.join("|") };
+            let _ = writeln!(writer, "HPC3 MISC state:");
+            let _ = writeln!(writer, "  intstat   = {:08x}  [{}]", s.intstat, names_s);
+            let _ = writeln!(writer, "  gio_misc  = {:08x}", s.gio_misc);
+            let _ = writeln!(writer, "  eeprom    = {:08x}", s.eeprom_reg);
+            return Ok(());
         }
 
         if cmd == "pdma" {
@@ -1579,13 +1648,14 @@ impl BusDevice for Hpc3 {
 
         // Misc Registers
         if (MISC_BASE..MISC_BASE + 0x1000).contains(&offset) {
-            let mut state = self.state.lock();
-            match offset - MISC_BASE {
+            let reg_off = offset - MISC_BASE;
+            match reg_off {
                 MISC_GIO_MISC => {
-                    state.gio_misc = val;
+                    self.state.lock().gio_misc = val;
                     dlog_dev!(LogModule::Hpc3, "HPC3: GIO_MISC ({:08x}) = {:08x}", addr, val);
                 }
                 MISC_EEPROM_DATA => {
+                    let mut state = self.state.lock();
                     state.eeprom_reg = val;
                     let mut eeprom = self.eeprom.lock();
                     // Bit 1: CS
@@ -1594,6 +1664,34 @@ impl BusDevice for Hpc3 {
                     eeprom.set_di((val & (1 << 3)) != 0);
                     // Bit 2: CLK
                     eeprom.set_sk((val & (1 << 2)) != 0);
+                }
+                MISC_INTSTAT | MISC_INTSTAT_BUG => {
+                    // W1C — writing 1 to a bit clears it.  For SCSI/ENET DMA
+                    // bits, also clear the per-channel PDMA INT flag and call
+                    // set_dma_interrupt(false) so the IOC line drops.
+                    let cleared = {
+                        let mut state = self.state.lock();
+                        let prev = state.intstat;
+                        state.intstat &= !val;
+                        prev & val
+                    };
+                    for (bit, ch_idx) in &[
+                        (HPC3_INTSTAT_SCSI0_DMA, HPC3_PDMA_CHAN_SCSI0 as usize),
+                        (HPC3_INTSTAT_SCSI1_DMA, HPC3_PDMA_CHAN_SCSI1 as usize),
+                        (HPC3_INTSTAT_ENET_RX_DMA, HPC3_PDMA_CHAN_ENET_RX as usize),
+                        (HPC3_INTSTAT_ENET_TX_DMA, HPC3_PDMA_CHAN_ENET_TX as usize),
+                    ] {
+                        if cleared & *bit != 0 {
+                            let mut chan = self.pdma_channels[*ch_idx].lock();
+                            if chan.ctrl & PDMA_CTRL_INT != 0 {
+                                chan.ctrl &= !PDMA_CTRL_INT;
+                                if let Some(cb) = &chan.callback {
+                                    cb.set_dma_interrupt(false);
+                                }
+                            }
+                        }
+                    }
+                    dlog_dev!(LogModule::Hpc3, "HPC3: MISC_INTSTAT W1C val={:08x} cleared={:08x}", val, cleared);
                 }
                 _ => {}
             }

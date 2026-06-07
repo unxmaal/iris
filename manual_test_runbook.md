@@ -80,7 +80,7 @@ du -sh saves/.cas
 
 ## Test 2 — Rollback inner loop
 
-The mogrix CI test loop: install bundle → run test → rollback → next bundle.
+The CI rollback inner loop: save → run test → rollback → repeat.
 
 ```bash
 ci save test-2/clean

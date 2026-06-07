@@ -57,8 +57,9 @@ boots to a usable system: shell, networking, X11, the works.
 ## Getting started
 
 You need:
-- `scsi1.raw` — raw hard disk image with IRIX 6.5.22 for Indy
-  (for a quick start get the MAME IRIX image from https://mirror.rqsall.com/sgi-mame/ and convert to raw using `chdman extractraw`)
+- A hard-disk image with IRIX 6.5.22 for Indy. To produce one, follow
+  `docs/irix-6.5.22-install.md` (install from the original 6.5.22 media
+  CDs into an empty CHD/raw disk).
 - `070-9101-011.bin` — Indy PROM image (optional; a default is embedded)
 
 ```
@@ -72,11 +73,44 @@ cargo run --release --features jit                   # enable Cranelift MIPS JIT
 cargo run --release --features rex-jit               # enable REX3 graphics JIT compiler
 cargo run --release --features tlbvmap               # enable 8k slot to tlb entry map (increases cache use but may help depending on host cpu arch)
 cargo run --release --features ci_clock              # synthetic deterministic CP0 Compare clock (CI/snapshot validator only; loses realtime desktop timing)
+cargo run --release --features chd                   # mount .chd disk/CD-ROM images directly (via libchdman-rs); off by default to keep builds light
+cargo run --release --features camera                # use host camera as the IndyCam video source (macOS AVFoundation via nokhwa). See [vino] in iris.toml.
 cargo run --release --features lightning,rex-jit,tlbvmap     # recommended for best speed right now
 ```
 
+### CHD image support (`--features chd`)
+
+Off by default. When enabled, IRIS can mount `.chd` hard-disk and CD-ROM
+images directly without first extracting to raw. Compressed parent CHDs
+stay untouched — writes go to a MAME-style `.diff.chd` sidecar.
+
+```
+cargo build --release --features chd
+```
+
+Without this feature, attempting to mount a `.chd` path returns an
+`Unsupported` error; raw images and COW overlays continue to work as
+before.
+
 See [HELP.md](HELP.md) for the full rundown: serial ports, monitor console,
 NVRAM/MAC address setup, disk image prep, and more.
+
+
+## R5000 CPU (`--features r5k`)
+
+Switches the emulated CPU from R4400 to R5000:
+
+- 32KB 2-way set-associative L1I and L1D (32B lines) instead of 16KB direct-mapped (16B lines)
+- PRID `0x00002321` (R5000 rev 2.1), FPU FIR `0x00002300` (imp 0x23)
+- CP0 Config reports `SC=1` (no secondary cache); PROM uses the 2-way index-flush path
+
+The 2-way associativity requires probing both ways on every fetch/read/write, which
+carries a small performance cost compared to the R4K direct-mapped path — expect
+roughly 5% lower instruction throughput.
+
+```
+cargo run --release --features r5k
+```
 
 
 ## JIT compilers

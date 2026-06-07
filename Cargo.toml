@@ -1,3 +1,6 @@
+[workspace]
+members = ["iris-gui"]
+
 [package]
 name = "iris"
 version = "0.1.0"
@@ -9,6 +12,7 @@ default-run = "iris"
 debug_cache = []
 developer = []
 developer_ip7 = []  # CP0 Compare/timer calibration stats and debug prints
+developerx = []     # Extended developer logging: breaks on IBE/DBE/ADEL/ADES/TLB errors
 # Synthetic deterministic clock for CP0 Compare calibration: dt_ns derived from
 # (instructions executed) * 10ns instead of host Instant::now(). Required for
 # the snapshot determinism validator (Phase 3.3). Default OFF preserves the
@@ -17,16 +21,48 @@ ci_clock = []
 # Lightning: pedal-to-the-metal build — disables breakpoint checks and traceback buffer updates.
 # Incompatible with interactive debugging. For end-user / benchmarking builds only.
 lightning = []
-# O(1) TLB fast path: 512KB inline vmap indexed by VA[31:13] replaces MRU linear scan
-# for 32-bit and sign-extended 64-bit VAs. Disable to benchmark against baseline.
+# O(1) TLB fast path: 512KB inline vmap indexed by VA[31:13] replaces linear scan
+# for 32-bit and sign-extended 64-bit VAs. Always on; kept as a feature flag so
+# downstream tooling that passes --features tlbvmap still compiles cleanly.
 tlbvmap = []
+# TLB translation statistics: per-AccessType counters for nanotlb, vmap, and
+# MRU scan paths including entries-walked totals.  Print at emulator exit.
+tlbstats = []
+# R5000 CPU: 2-way set-associative 32KB L1I/L1D (32B lines), non-inclusive cache hierarchy.
+# Switches PRID/FIR to R5000 values and selects 2-way L1 probe/fill paths.
+r5k = []
+# Secondary cache present. Without this flag the CPU reports SC=1 (no secondary cache)
+# and the L2 is bypassed entirely. Use alone for external R4600SC-style cache sized via
+# EEPROM, or together with r5ksc_triton for Triton on-die L2.
+r5ksc = []
+# Triton integrated L2: on-die 1MB/32B cache reported via CONFIG.SC=0, controlled via
+# CONFIG.SE (bit 12 enable/disable), and sized via CONFIG.SS (bits 23:22).
+# Implies r5ksc (Triton always has secondary cache present).
+r5ksc_triton = ["r5ksc"]
+# Idle detection + in-place CPU park: when the guest sits in its interrupt-enabled
+# idle loop, sleep the CPU thread until the next timer tick / device interrupt
+# rather than spinning the host core (see docs/idle-pause-work.md). Wallclock-
+# anchored timing; the IRIS_NO_IDLE env var disables it at runtime when compiled
+# in. OFF by default (the CPU thread spins) — opt in with --features idle-pause;
+# off keeps deterministic-clock and raw-benchmark builds simple.
+idle-pause = []
+default = ["tlbvmap"]
 # Cranelift-based JIT compiler for MIPS → native translation.
 jit = ["cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelift-module", "cranelift-native", "target-lexicon"]
 # Cranelift-based JIT compiler for REX3 graphics draw shaders.
 rex-jit = ["cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelift-module", "cranelift-native"]
 # Use WindowEvent::CursorMoved for mouse motion instead of DeviceEvent::MouseMotion.
 # Useful for testing absolute cursor position tracking. May cause doubled moves on some platforms.
-mouseabs = []
+# CHD disk image support (SCSI HDDs and CD-ROMs) via libchdman-rs.
+# Off by default — enable with `cargo build --features chd`.
+chd = ["dep:libchdman-rs"]
+# Live host camera capture as the VINO video source (phase 3 of IndyCam
+# emulation).  Platform backends:
+#   macOS   — nokhwa AVFoundation (dep:nokhwa)
+#   Linux   — v4l crate directly (dep:v4l); requires libv4l-dev at build time
+#   Windows — nokhwa MediaFoundation (dep:nokhwa)
+# Off by default — enable with `cargo build --features camera`.
+camera = ["dep:nokhwa", "dep:v4l"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -58,6 +94,17 @@ cranelift-jit        = { version = "0.116", optional = true }
 cranelift-module     = { version = "0.116", optional = true }
 cranelift-native     = { version = "0.116", optional = true }
 target-lexicon       = { version = "0.13",  optional = true }
+libchdman-rs = { version = "0.287.0-l7", features = ["prebuilt"], optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+nokhwa = { version = "0.10", features = ["input-avfoundation"], optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nokhwa = { version = "0.10", optional = true }
+v4l    = { version = "0.14", features = ["v4l2-sys"], optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+nokhwa = { version = "0.10", features = ["input-msmf"], optional = true }
 
 [target.'cfg(not(windows))'.dependencies]
 libc = "0.2"
@@ -77,6 +124,7 @@ debug = true
 lto = "fat"
 codegen-units = 1
 
+
 # Profiling profile: release optimizations + full debug info for flamegraph/perf.
 # Usage: cargo build --profile profiling && perf record ./target/profiling/iris
 #        cargo flamegraph --profile profiling
@@ -84,7 +132,6 @@ codegen-units = 1
 inherits = "release"
 debug = 2
 strip = false
-force-frame-pointers = true
 
 [[bin]]
 name = "iris"
@@ -97,6 +144,11 @@ path = "src/coffdump.rs"
 [[bin]]
 name = "iris-ci"
 path = "src/iris_ci_main.rs"
+
+[[bin]]
+name = "chd_extract"
+path = "src/bin/chd_extract.rs"
+required-features = ["chd"]
 
 
 

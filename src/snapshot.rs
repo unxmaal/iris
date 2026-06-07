@@ -44,6 +44,41 @@ pub struct Snapshot {
     pub dir: PathBuf,
 }
 
+/// Identity of a configured SCSI disk image at capture time. Recorded so a
+/// restore can refuse to paste captured RAM/COW state onto a different base
+/// disk (which would silently corrupt the guest filesystem). Identity is the
+/// configured path plus the host file size in bytes — cheap to compute and
+/// catches the common wrong-disk / wrong-config / resized-image cases without
+/// hashing multi-GB images.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiskRef {
+    pub id: u8,
+    pub path: String,
+    pub size_bytes: u64,
+}
+
+/// Build the list of cargo features enabled in this binary. Recorded in the
+/// manifest and required to match on restore, since features such as `ci_clock`
+/// (synthetic clock) and `jit` change CPU/timer semantics that the captured
+/// state assumes. Sorted for stable comparison.
+pub fn enabled_features() -> Vec<String> {
+    let mut f: Vec<String> = Vec::new();
+    macro_rules! push_if { ($name:literal) => { if cfg!(feature = $name) { f.push($name.to_string()); } } }
+    push_if!("jit");
+    push_if!("rex-jit");
+    push_if!("lightning");
+    push_if!("ci_clock");
+    push_if!("tlbvmap");
+    push_if!("chd");
+    push_if!("camera");
+    push_if!("developer");
+    push_if!("developer_ip7");
+    push_if!("tlbstats");
+    push_if!("debug_cache");
+    f.sort();
+    f
+}
+
 /// Top-level snapshot manifest. Lives at `saves/<name>/snapshot.toml`. Written
 /// first on save and read first on load so the rest of the pipeline can fail
 /// fast with a clear error before reading half a snapshot.
@@ -56,6 +91,13 @@ pub struct Manifest {
     pub parent: Option<String>,
     pub description: Option<String>,
     pub installed_bundles: Vec<String>,
+    /// Cargo features enabled in the build that captured this snapshot.
+    /// Empty for legacy manifests written before provenance was recorded.
+    pub features: Vec<String>,
+    /// Configured SCSI disks at capture time. Empty for legacy manifests.
+    pub disks: Vec<DiskRef>,
+    /// Configured nvram file path at capture time. None for legacy manifests.
+    pub nvram: Option<String>,
 }
 
 impl Manifest {
@@ -74,6 +116,11 @@ impl Manifest {
             parent: None,
             description: None,
             installed_bundles: Vec::new(),
+            features: enabled_features(),
+            // Filled in by the Machine, which is the only thing that knows the
+            // configured disks and nvram path.
+            disks: Vec::new(),
+            nvram: None,
         }
     }
 
@@ -94,6 +141,25 @@ impl Manifest {
         let bundles: Vec<Value> = self.installed_bundles.iter()
             .map(|s| Value::String(s.clone())).collect();
         tbl.insert("installed_bundles".into(), Value::Array(bundles));
+
+        // Provenance (additive; omitted when empty so legacy diffs stay clean).
+        if !self.features.is_empty() {
+            let feats: Vec<Value> = self.features.iter().map(|s| Value::String(s.clone())).collect();
+            tbl.insert("features".into(), Value::Array(feats));
+        }
+        if !self.disks.is_empty() {
+            let disks: Vec<Value> = self.disks.iter().map(|d| {
+                let mut dt = toml::map::Map::new();
+                dt.insert("id".into(), Value::Integer(d.id as i64));
+                dt.insert("path".into(), Value::String(d.path.clone()));
+                dt.insert("size_bytes".into(), Value::Integer(d.size_bytes as i64));
+                Value::Table(dt)
+            }).collect();
+            tbl.insert("disks".into(), Value::Array(disks));
+        }
+        if let Some(nv) = &self.nvram {
+            tbl.insert("nvram".into(), Value::String(nv.clone()));
+        }
         Value::Table(tbl)
     }
 
@@ -117,6 +183,24 @@ impl Manifest {
             .and_then(|x| x.as_array())
             .map(|arr| arr.iter().filter_map(|x| x.as_str().map(String::from)).collect())
             .unwrap_or_default();
+        // Provenance — absent in legacy (pre-provenance) manifests; default to
+        // empty/None so those still load (validation treats empty as "unknown").
+        let features = tbl.get("features")
+            .and_then(|x| x.as_array())
+            .map(|arr| arr.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        let disks = tbl.get("disks")
+            .and_then(|x| x.as_array())
+            .map(|arr| arr.iter().filter_map(|x| {
+                let t = x.as_table()?;
+                Some(DiskRef {
+                    id: t.get("id").and_then(|v| v.as_integer())? as u8,
+                    path: t.get("path").and_then(|v| v.as_str())?.to_string(),
+                    size_bytes: t.get("size_bytes").and_then(|v| v.as_integer())? as u64,
+                })
+            }).collect())
+            .unwrap_or_default();
+        let nvram = tbl.get("nvram").and_then(|x| x.as_str()).map(String::from);
         Ok(Self {
             schema_version,
             iris_git_rev,
@@ -125,6 +209,9 @@ impl Manifest {
             parent,
             description,
             installed_bundles,
+            features,
+            disks,
+            nvram,
         })
     }
 }
@@ -488,8 +575,11 @@ mod tests {
             host_arch: "aarch64".into(),
             created_at_unix: 1_700_000_000,
             parent: Some("base/desktop".into()),
-            description: Some("post mogrix install".into()),
+            description: Some("post install".into()),
             installed_bundles: vec!["grep-2.5.4".into(), "sed-4.2.2".into()],
+            features: vec!["jit".into(), "tlbvmap".into()],
+            disks: vec![DiskRef { id: 1, path: "irix53.raw".into(), size_bytes: 4294967296 }],
+            nvram: Some("nvram-irix53.bin".into()),
         };
         let v = m.to_toml();
         let m2 = Manifest::from_toml(&v).expect("parse");
@@ -500,6 +590,9 @@ mod tests {
         assert_eq!(m2.parent, m.parent);
         assert_eq!(m2.description, m.description);
         assert_eq!(m2.installed_bundles, m.installed_bundles);
+        assert_eq!(m2.features, m.features);
+        assert_eq!(m2.disks, m.disks);
+        assert_eq!(m2.nvram, m.nvram);
     }
 
     #[test]
@@ -512,6 +605,9 @@ mod tests {
             parent: None,
             description: None,
             installed_bundles: vec![],
+            features: vec![],
+            disks: vec![],
+            nvram: None,
         };
         let v = m.to_toml();
         let m2 = Manifest::from_toml(&v).expect("parse");
@@ -519,6 +615,9 @@ mod tests {
         assert!(m2.parent.is_none());
         assert!(m2.description.is_none());
         assert!(m2.installed_bundles.is_empty());
+        assert!(m2.features.is_empty());
+        assert!(m2.disks.is_empty());
+        assert!(m2.nvram.is_none());
     }
 
     #[test]

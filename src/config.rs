@@ -1,5 +1,6 @@
 use clap::Parser;
 use serde::{Deserialize, Serialize};
+use std::net::Ipv4Addr;
 
 /// Valid memory bank sizes in MB.
 pub const VALID_BANK_SIZES: &[u32] = &[0, 8, 16, 32, 64, 128];
@@ -89,32 +90,145 @@ fn default_unfsd()          -> String { "unfsd".to_string() }
 fn default_nfs_host_port()  -> u16    { 12049 }
 fn default_mountd_host_port() -> u16  { 11234 }
 
+/// Pre-parsed NAT subnet derived from a CIDR string.
+#[derive(Debug, Clone, Copy)]
+pub struct NatSubnet {
+    pub gateway_ip: Ipv4Addr,
+    pub client_ip:  Ipv4Addr,
+    pub netmask:    Ipv4Addr,
+}
+
+impl Default for NatSubnet {
+    fn default() -> Self {
+        Self {
+            gateway_ip: Ipv4Addr::new(192, 168, 0, 1),
+            client_ip:  Ipv4Addr::new(192, 168, 0, 2),
+            netmask:    Ipv4Addr::new(255, 255, 255, 0),
+        }
+    }
+}
+
+/// Networking parameters extracted from `MachineConfig` for the NAT engine and HPC3.
+#[derive(Debug, Clone, Default)]
+pub struct NetworkConfig {
+    pub nfs:          Option<NfsConfig>,
+    pub port_forward: Vec<PortForwardConfig>,
+    /// Parsed subnet; None means use the built-in default (192.168.0.0/24).
+    pub nat_subnet:   Option<NatSubnet>,
+}
+
+/// Where VINO's video-in capture should come from.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum VinoSource {
+    /// Live host camera capture (requires building with `--features camera`).
+    /// First run on macOS triggers the camera permission dialog.
+    Camera,
+    /// SMPTE-style colour bars + animated luma ramp.  No host capture needed.
+    TestPattern,
+    /// Solid black field.  Useful when you want IRIX video drivers to attach
+    /// but don't want any host camera permission prompt or test pattern.
+    Black,
+    /// Video-In disabled: VINO stays memory-mapped (IRIX can still probe it)
+    /// but no video source is installed and the DMA pump thread is never
+    /// started.  Use this to skip Video-In entirely.
+    Off,
+}
+
+impl Default for VinoSource {
+    // Off by default: most users don't need IndyCam, and this avoids a host
+    // camera permission prompt, the test-pattern source, and VINO's DMA pump
+    // thread. Set a source explicitly (`[vino] source = "..."`) to enable it.
+    fn default() -> Self { VinoSource::Off }
+}
+
+/// Broadcast video standard the source emits.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum VinoStandard {
+    /// 525-line / 60-field interlaced (NTSC, 640×486 frame).
+    Ntsc,
+    /// 625-line / 50-field interlaced (PAL, 768×576 frame).
+    Pal,
+}
+
+impl Default for VinoStandard {
+    fn default() -> Self { VinoStandard::Ntsc }
+}
+
+/// VINO video-in configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VinoConfig {
+    /// Where the IndyCam feed comes from.
+    #[serde(default)]
+    pub source: VinoSource,
+    /// Broadcast standard.  Affects field rate (60 vs 50 Hz) and field size.
+    #[serde(default)]
+    pub standard: VinoStandard,
+    /// Index of the host camera to open (0 = default).  Only meaningful when
+    /// `source = "camera"`.
+    #[serde(default)]
+    pub camera_index: u32,
+}
+
+/// (De)serialize the `scsi` map through string keys. TOML (and the `toml`
+/// crate's serializer) requires map keys to be strings, but the map is keyed
+/// by `u8`, so `toml::to_string` would fail with "map key was not a string".
+/// JSON is unaffected (it already stringifies map keys); this just makes the
+/// representation explicit and symmetric so iris.toml export round-trips.
+mod scsi_keys {
+    use super::ScsiDeviceConfig;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::{BTreeMap, HashMap};
+
+    pub fn serialize<S: Serializer>(
+        map: &HashMap<u8, ScsiDeviceConfig>,
+        ser: S,
+    ) -> Result<S::Ok, S::Error> {
+        // BTreeMap → stable, ID-sorted output.
+        map.iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect::<BTreeMap<String, &ScsiDeviceConfig>>()
+            .serialize(ser)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        de: D,
+    ) -> Result<HashMap<u8, ScsiDeviceConfig>, D::Error> {
+        HashMap::<String, ScsiDeviceConfig>::deserialize(de)?
+            .into_iter()
+            .map(|(k, v)| k.parse::<u8>().map(|id| (id, v)).map_err(serde::de::Error::custom))
+            .collect()
+    }
+}
+
 /// Top-level machine configuration.
+///
+/// Field order matters for TOML export: the `toml` serializer requires every
+/// scalar/inline-value field to be emitted before any table or array-of-table
+/// field, so all scalars are declared first and the table-valued fields
+/// (`scsi`, `nfs`, `port_forward`, `vino`) come last.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MachineConfig {
     /// Path to the PROM ROM image.
     #[serde(default = "default_prom")]
     pub prom: String,
 
+    /// Path to the NVRAM file. The emulated DS1386 NVRAM is loaded from
+    /// here at startup (if the file exists) and `iris-ci rtc-save` writes
+    /// back to it by default. Per-config NVRAM files avoid the footgun
+    /// where two configs (e.g. iris-irix53.toml and iris-irix65.toml)
+    /// otherwise share `nvram.bin` and overwrite each other's PROM env.
+    #[serde(default = "default_nvram")]
+    pub nvram: String,
+
     /// RAM bank sizes in MB. Valid values: 0 (absent), 8, 16, 32, 64, 128.
     #[serde(default = "default_banks")]
     pub banks: [u32; 4],
 
-    /// SCSI devices keyed by ID 1–7. Missing IDs are not attached.
-    #[serde(default = "default_scsi")]
-    pub scsi: std::collections::HashMap<u8, ScsiDeviceConfig>,
-
     /// Window scale factor (1 = native, 2 = 2× for HiDPI/4K). CLI --2x overrides this.
     #[serde(default = "default_scale")]
     pub scale: u32,
-
-    /// NFS share configuration. If present, unfsd is started and NFS is available inside the VM.
-    #[serde(default)]
-    pub nfs: Option<NfsConfig>,
-
-    /// Port forwarding rules (host port → guest port).
-    #[serde(default)]
-    pub port_forward: Vec<PortForwardConfig>,
 
     /// Run without graphics (no window, no REX3). Use no_audio to also disable HAL2.
     /// Useful for headless/server/CI environments.
@@ -126,8 +240,14 @@ pub struct MachineConfig {
     pub no_audio: bool,
 
     /// If Some(port), start the GDB RSP stub on that TCP port.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gdb_port: Option<u16>,
+
+    /// NAT subnet in CIDR notation (e.g. "192.168.5.0/24").
+    /// The gateway gets host .1 and the guest (IRIX) gets host .2.
+    /// Defaults to "192.168.0.0/24" if not set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nat_subnet: Option<String>,
 
     /// CI mode: opens a control socket for automation, applies speed-favoring
     /// fidelity shortcuts. Implies headless unless ci_display is also set.
@@ -142,12 +262,47 @@ pub struct MachineConfig {
     /// interactive test development.
     #[serde(default)]
     pub ci_display: bool,
+
+    /// Pixels of host trackpad/wheel movement that equal one PS/2 scroll
+    /// detent. Lower = faster scroll; higher = slower. Default 40.
+    /// Tune if scroll feels too fast or too slow on your hardware.
+    #[serde(default = "default_scroll_pixels_per_line")]
+    pub mouse_scroll_pixels_per_line: f64,
+
+    /// Optional file path that will receive every byte emitted on ttyd1
+    /// (the IRIX serial console) in `--ci` mode. Append-only. Useful for
+    /// keeping a continuously-updated transcript of the install or test run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial_log: Option<String>,
+
+    // --- table / array-of-table fields: must be emitted after all scalars ---
+
+    /// SCSI devices keyed by ID 1–7. Missing IDs are not attached.
+    #[serde(default = "default_scsi", with = "scsi_keys")]
+    pub scsi: std::collections::HashMap<u8, ScsiDeviceConfig>,
+
+    /// NFS share configuration. If present, unfsd is started and NFS is available inside the VM.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nfs: Option<NfsConfig>,
+
+    /// Port forwarding rules (host port → guest port).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub port_forward: Vec<PortForwardConfig>,
+
+    /// VINO video-in configuration (IndyCam emulation source).
+    #[serde(default)]
+    pub vino: VinoConfig,
 }
 
 fn default_ci_socket() -> String { "/tmp/iris.sock".to_string() }
+fn default_scroll_pixels_per_line() -> f64 { 40.0 }
 
 fn default_prom() -> String {
     "prom.bin".to_string()
+}
+
+fn default_nvram() -> String {
+    "nvram.bin".to_string()
 }
 
 fn default_banks() -> [u32; 4] {
@@ -181,6 +336,7 @@ impl Default for MachineConfig {
     fn default() -> Self {
         Self {
             prom: default_prom(),
+            nvram: default_nvram(),
             banks: default_banks(),
             scsi: default_scsi(),
             scale: default_scale(),
@@ -189,9 +345,13 @@ impl Default for MachineConfig {
             headless: false,
             no_audio: false,
             gdb_port: None,
+            nat_subnet: None,
             ci: false,
             ci_socket: default_ci_socket(),
             ci_display: false,
+            serial_log: None,
+            vino: VinoConfig::default(),
+            mouse_scroll_pixels_per_line: default_scroll_pixels_per_line(),
         }
     }
 }
@@ -225,15 +385,36 @@ impl MachineConfig {
                 ));
             }
         }
+        if let Some(ref s) = self.nat_subnet {
+            if let Err(e) = parse_nat_subnet(s) {
+                return Err(format!("nat_subnet \"{}\": {}", s, e));
+            }
+        }
         for (id, dev) in &self.scsi {
             if *id == 0 || *id > 7 {
                 return Err(format!("SCSI ID {} is out of range (1–7)", id));
             }
-            if dev.cdrom && dev.path.is_empty() && dev.discs.is_empty() {
-                return Err(format!("SCSI ID {} is a CD-ROM but has no disc", id));
-            }
+            // CD-ROM with empty path + no changer entries = drive present, no
+            // media loaded. This is a valid runtime state (see
+            // Wd33c93a::add_device empty-CD-ROM path / insert_disc).
+            let _ = dev; // explicitly keep the binding for future checks
         }
         Ok(())
+    }
+
+    /// Extract network-related settings into a `NetworkConfig`.
+    /// Parses `nat_subnet` from CIDR — safe to unwrap because `validate()` already accepted it.
+    pub fn network(&self) -> NetworkConfig {
+        let nat_subnet = self.nat_subnet.as_deref().map(|cidr| {
+            let (gateway_ip, client_ip, netmask) = parse_nat_subnet(cidr)
+                .expect("nat_subnet: validate() should have caught this");
+            NatSubnet { gateway_ip, client_ip, netmask }
+        });
+        NetworkConfig {
+            nfs:          self.nfs.clone(),
+            port_forward: self.port_forward.clone(),
+            nat_subnet,
+        }
     }
 
     /// Return the active disc path for a CD-ROM device (first of `discs` list,
@@ -257,6 +438,10 @@ pub struct Cli {
     /// Path to PROM image
     #[arg(long)]
     pub prom: Option<String>,
+
+    /// Path to NVRAM file (default: nvram.bin in cwd)
+    #[arg(long)]
+    pub nvram: Option<String>,
 
     /// RAM bank 0 size in MB (0/8/16/32/64/128)
     #[arg(long)]
@@ -342,6 +527,11 @@ pub struct Cli {
     #[arg(long = "mountd-port", value_name = "PORT")]
     pub mountd_host_port: Option<u16>,
 
+    /// NAT subnet in CIDR notation (e.g. 192.168.5.0/24).
+    /// Gateway gets .1, guest (IRIX) gets .2. Default: 192.168.0.0/24.
+    #[arg(long = "nat-subnet", value_name = "CIDR")]
+    pub nat_subnet: Option<String>,
+
     /// Enable GDB stub on the given TCP port (e.g. --gdb-port 1234).
     /// Connect with: target remote localhost:<port>
     #[arg(long = "gdb-port", value_name = "PORT")]
@@ -360,12 +550,18 @@ pub struct Cli {
     /// development (deferred rendering at 10–15 fps).
     #[arg(long = "ci-display", default_value_t = false)]
     pub ci_display: bool,
+
+    /// With --ci, append every byte the guest emits on ttyd1 (IRIX serial
+    /// console) to this file. Useful for live tailing during an install.
+    #[arg(long = "serial-log", value_name = "FILE")]
+    pub serial_log: Option<String>,
 }
 
 impl Cli {
     /// Merge CLI overrides into a base `MachineConfig`.
     pub fn apply(&self, mut cfg: MachineConfig) -> MachineConfig {
         if let Some(p) = &self.prom    { cfg.prom = p.clone(); }
+        if let Some(p) = &self.nvram   { cfg.nvram = p.clone(); }
         if let Some(v) = self.bank0    { cfg.banks[0] = v; }
         if let Some(v) = self.bank1    { cfg.banks[1] = v; }
         if let Some(v) = self.bank2    { cfg.banks[2] = v; }
@@ -404,6 +600,7 @@ impl Cli {
         if self.ci         { cfg.ci         = true; }
         if let Some(p) = &self.ci_socket { cfg.ci_socket = p.clone(); }
         if self.ci_display { cfg.ci_display = true; }
+        if let Some(p) = &self.serial_log { cfg.serial_log = Some(p.clone()); }
         // NB: --ci does NOT imply --headless. REX3 stays alive so screenshots
         // work; main.rs simply skips the host window when ci && !ci_display.
 
@@ -424,6 +621,7 @@ impl Cli {
         }
 
         if let Some(p) = self.gdb_port { cfg.gdb_port = Some(p); }
+        if let Some(ref s) = self.nat_subnet { cfg.nat_subnet = Some(s.clone()); }
 
         cfg
     }
@@ -441,4 +639,49 @@ pub fn load_config() -> (MachineConfig, u32) {
         std::process::exit(1);
     }
     (cfg, scale)
+}
+
+/// Parse a CIDR string like "192.168.5.0/24" and return
+/// `(gateway_ip, client_ip, netmask)` where gateway=host .1, client=host .2.
+///
+/// Returns an error string on invalid input.
+pub fn parse_nat_subnet(cidr: &str) -> Result<(std::net::Ipv4Addr, std::net::Ipv4Addr, std::net::Ipv4Addr), String> {
+    let (addr_str, prefix_str) = cidr.split_once('/').ok_or("expected format IP/PREFIX (e.g. 192.168.5.0/24)")?;
+    let base: std::net::Ipv4Addr = addr_str.parse().map_err(|_| format!("invalid IPv4 address \"{}\"", addr_str))?;
+    let prefix: u8 = prefix_str.parse().map_err(|_| format!("invalid prefix length \"{}\"", prefix_str))?;
+    if prefix > 30 {
+        return Err(format!("prefix /{} is too small (minimum /30)", prefix));
+    }
+    let mask = if prefix == 0 { 0u32 } else { !0u32 << (32 - prefix) };
+    let network = u32::from(base) & mask;
+    if u32::from(base) != network {
+        return Err(format!("address {} is not the network address for /{} (did you mean {}.0/{}?)",
+            base, prefix,
+            std::net::Ipv4Addr::from(network & 0xFFFFFF00),
+            prefix));
+    }
+    let netmask = std::net::Ipv4Addr::from(mask);
+    let gateway_ip = std::net::Ipv4Addr::from(network + 1);
+    let client_ip  = std::net::Ipv4Addr::from(network + 2);
+    Ok((gateway_ip, client_ip, netmask))
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::*;
+
+    #[test]
+    fn toml_export_roundtrips() {
+        let mut cfg = MachineConfig::default();
+        cfg.scsi.insert(4, ScsiDeviceConfig {
+            path: "/abs/cd.chd".into(), discs: vec![], cdrom: true,
+            overlay: false, scratch: false, size_mb: None,
+        });
+        let s = toml::to_string_pretty(&cfg).expect("serialize");
+        let back: MachineConfig = toml::from_str(&s).expect("deserialize");
+        assert_eq!(back.scsi.len(), cfg.scsi.len());
+        assert_eq!(back.scsi[&1].path, cfg.scsi[&1].path);
+        assert_eq!(back.scsi[&4].cdrom, true);
+        println!("--- exported toml ---\n{s}");
+    }
 }

@@ -8,4 +8,6 @@ scsi1.raw
 scsi2.raw
 cdrom4.iso
 Cargo.lock
+iris.toml
+nvram.bin
 *.log

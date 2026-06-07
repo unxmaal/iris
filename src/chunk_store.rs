@@ -4,9 +4,9 @@
 //! and stored as `saves/.cas/<hex2>/<hex62>` (sharded by the first byte to
 //! keep any one directory under a few thousand files). Snapshots reference
 //! chunks by hash; identical chunks across snapshots share storage. A
-//! `mogrix-bundle-test` workflow that snapshots between every install
-//! shares 95–99% of RAM with its parent, so adding a new snapshot costs
-//! only the bytes that actually changed.
+//! workflow that snapshots between every install shares 95–99% of RAM with
+//! its parent, so adding a new snapshot costs only the bytes that actually
+//! changed.
 //!
 //! Layout:
 //! ```text

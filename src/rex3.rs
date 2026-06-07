@@ -554,17 +554,20 @@ fn to12_4_7(val: i32) -> u32 {
     (val as u32).rexget(9, 7)
 }
 
-// COLORRED: o12.11 for CI mode, o8.15 for RGB mode
-// Write format: o12.11 (9 top bits overflow, 12 integer, 11 fractional)
-// Read format: o12.11 (same masking)
-// COLORRED: o12.11 format in both CI and RGB modes.
-// Wire format: bits[23:0] = o1 + 12 integer bits + 11 fractional bits.
-// Color registers: plain u32.
-// COLORRED:         o12.11 — bits[23:0] stored raw (24 bits). bit31 = overflow/neg after DDA.
-// COLORALPHA/GRN/BLUE: o8.11 — bits[19:0] stored raw (20 bits).
+// COLORRED internal format: o12.11 (sign bit + 12 integer bits + 11 fractional bits = 24 bits).
+// Write wire format depends on mode:
+//   - 12-bit CI mode (rgbmode=0, drawdepth=2): o12.9 on the bus → shift left 2 into o12.11.
+//   - All other modes: o12.11 on the bus → store raw low 24 bits.
+// Read wire format: always o12.11, low 24 bits.
+// get_colori() in CI mode: integer part = bits[22:11], i.e. (colorred >> 11) & 0xFFF.
 
-fn from_color_red(val: u32, _drawmode1: DrawMode1) -> u32 {
-    val & 0xFFFFFF
+fn from_color_red(val: u32, drawmode1: DrawMode1) -> u32 {
+    if !drawmode1.rgbmode() && drawmode1.drawdepth() == 2 {
+        // 12-bit CI mode: bus value is o12.9, shift left 2 to store as o12.11.
+        (val << 2) & 0xFFFFFF
+    } else {
+        val & 0xFFFFFF
+    }
 }
 fn to_color_red(val: u32, _drawmode1: DrawMode1) -> u32 {
     val & 0xFFFFFF
@@ -1007,6 +1010,9 @@ pub struct Rex3 {
     pub px_wr: UnsafeCell<fn(&Rex3, u32, u32)>,
     pub px_amp: UnsafeCell<fn(u32) -> u32>,
     pub px_logic: UnsafeCell<fn(u32, u32) -> u32>,
+    /// Pack bayer index into bits [27:24] for dither compress functions (rgbmode=1 only).
+    /// In CI mode this is a no-op (returns color unchanged) — CI values need no dithering.
+    pub px_bayer: UnsafeCell<fn(u32, i32, i32) -> u32>,
     /// Compress 24-bit BGR → plane-depth pixel (rgbmode=1 only; identity otherwise).
     pub px_compress: UnsafeCell<fn(u32) -> u32>,
     /// Expand plane-depth pixel → 24-bit BGR (for blend dst; identity for CI/24bpp).
@@ -1035,6 +1041,21 @@ pub struct Rex3 {
     pub gfxbusy: Arc<AtomicBool>,
     pub processor_thread: Mutex<Option<thread::JoinHandle<()>>>,
     pub refresh_thread: Mutex<Option<thread::JoinHandle<()>>>,
+    /// True while the REX3-Processor thread is parked on an empty gfifo. The
+    /// producer (`gfifo_push`) checks this and unparks the consumer so a fresh
+    /// command is picked up immediately instead of after the park timeout.
+    #[cfg(feature = "idle-pause")]
+    processor_parked: AtomicBool,
+    /// Handle to the REX3-Processor thread, set once when it starts, used by
+    /// `gfifo_push` to unpark it. OnceLock gives lock-free reads on the hot path.
+    #[cfg(feature = "idle-pause")]
+    processor_unparker: std::sync::OnceLock<thread::Thread>,
+    /// Set by the gfifo consumer whenever it processes activity that may have
+    /// changed the framebuffer. The refresh thread renders only when this (or a
+    /// palette/cursor/mode change) is seen, rather than re-converting and
+    /// re-uploading the whole framebuffer at 60 Hz on a static screen. Starts
+    /// true so the first frame always renders.
+    fb_dirty: AtomicBool,
     pub screen: Arc<Mutex<Rex3Screen>>,
     pub vblank_cb: Mutex<Option<Arc<dyn Fn(bool) + Send + Sync>>>,
     /// Incremented each time an XMAP mode table entry is written (buf_sel flip signal).
@@ -1165,6 +1186,7 @@ impl Rex3 {
             px_wr: UnsafeCell::new(Self::default_px_wr),
             px_amp: UnsafeCell::new(Self::amplify_nop),
             px_logic: UnsafeCell::new(Self::logic_op_src),
+            px_bayer: UnsafeCell::new(Self::bayer_pack),
             px_compress: UnsafeCell::new(Self::identity),
             px_expand: UnsafeCell::new(Self::identity),
             px_proc: UnsafeCell::new(Self::process_pixel_noop),
@@ -1186,6 +1208,11 @@ impl Rex3 {
             gfxbusy: Arc::new(AtomicBool::new(false)),
             processor_thread: Mutex::new(None),
             refresh_thread: Mutex::new(None),
+            #[cfg(feature = "idle-pause")]
+            processor_parked: AtomicBool::new(false),
+            #[cfg(feature = "idle-pause")]
+            processor_unparker: std::sync::OnceLock::new(),
+            fb_dirty: AtomicBool::new(true),
             screen,
             vblank_cb: Mutex::new(None),
             xmap_fence: AtomicU32::new(0),
@@ -1918,6 +1945,7 @@ impl Rex3 {
     fn bayer_pack(color: u32, x: i32, y: i32) -> u32 {
         (color & 0x00FFFFFF) | (((y as u32 & 3) << 2 | (x as u32 & 3)) << 24)
     }
+    fn bayer_nop(color: u32, _x: i32, _y: i32) -> u32 { color }
 
     #[inline(always)]
     fn bayer_threshold(idx: u32) -> u32 {
@@ -2374,17 +2402,12 @@ impl Rex3 {
     fn process_pixel_draw(&self, ctx: &mut Rex3Context, x: i32, y: i32) {
         let colorhost = ctx.drawmode0.colorhost();
         let alphahost = ctx.drawmode0.alphahost();
-        
-        let host_pixel = if alphahost || colorhost {
-            self.fetch_host_pixel(ctx)
-        } else {
-            0
-        };
 
         let mut use_bg = false;
         let mut check_ls = true;
 
-        // Pattern checks use independent bit indices; advance is done by px_pattern after the pixel.
+        // Pattern checks first — host pixel only consumed when the pixel is actually drawn.
+        // MAME: get_host_color() called only inside if(BIT(pattern, bit)), never on skip/opaque paths.
         if ctx.drawmode0.enzpattern() {
             let bit = (ctx.zpattern >> ctx.zpat_bit) & 1 != 0;
             if !bit {
@@ -2407,6 +2430,13 @@ impl Rex3 {
                 }
             }
         }
+
+        // Fetch host pixel only when the pattern passes and we're drawing from host (not colorback).
+        let host_pixel = if !use_bg && (alphahost || colorhost) {
+            self.fetch_host_pixel(ctx)
+        } else {
+            0
+        };
 
         if let Some(addr) = self.calculate_fb_address(x, y, ctx, true) {
             // CID Masking
@@ -2441,14 +2471,16 @@ impl Rex3 {
                 };
                 let blended = self.blend(ctx, raw_src, dst_raw);
                 // Compress blended 24-bit result back to plane-depth before write.
-                compress_fn(Self::bayer_pack(blended, x, y))
+                let bayer_fn = unsafe { *self.px_bayer.get() };
+                compress_fn(bayer_fn(blended, x, y))
             } else {
                 // Logic op path: compress src to plane-depth, amplify for dblsrc, then logic op.
                 // dst also needs amplify: rd_fn shifts the value down (e.g. bits 15:8 → 7:0 for
                 // dblsrc slot 1), so we must shift it back up to match the write mask position.
+                let bayer_fn = unsafe { *self.px_bayer.get() };
                 let amp_fn = unsafe { *self.px_amp.get() };
                 let logic_fn = unsafe { *self.px_logic.get() };
-                let src = amp_fn(compress_fn(Self::bayer_pack(raw_src, x, y)));
+                let src = amp_fn(compress_fn(bayer_fn(raw_src, x, y)));
                 let dst = amp_fn(rd_fn(self, addr));
                 logic_fn(src, dst)
             };
@@ -2467,9 +2499,10 @@ impl Rex3 {
         if let Some(addr) = self.calculate_fb_address(x, y, ctx, true) {
             let wr_fn       = unsafe { *self.px_wr.get() };
             let amp_fn      = unsafe { *self.px_amp.get() };
+            let bayer_fn    = unsafe { *self.px_bayer.get() };
             let compress_fn = unsafe { *self.px_compress.get() };
             // SRC logicop: result = src, no dst read needed.
-            wr_fn(self, addr, amp_fn(compress_fn(Self::bayer_pack(ctx.get_colori(), x, y))));
+            wr_fn(self, addr, amp_fn(compress_fn(bayer_fn(ctx.get_colori(), x, y))));
         }
     }
 
@@ -2498,9 +2531,10 @@ impl Rex3 {
             let rd_fn       = unsafe { *self.px_rd.get() };
             let wr_fn       = unsafe { *self.px_wr.get() };
             let amp_fn      = unsafe { *self.px_amp.get() };
+            let bayer_fn    = unsafe { *self.px_bayer.get() };
             let compress_fn = unsafe { *self.px_compress.get() };
             let logic_fn    = unsafe { *self.px_logic.get() };
-            let src = amp_fn(compress_fn(Self::bayer_pack(raw_src, x, y)));
+            let src = amp_fn(compress_fn(bayer_fn(raw_src, x, y)));
             let dst = amp_fn(rd_fn(self, addr));
             wr_fn(self, addr, logic_fn(src, dst));
         }
@@ -2885,6 +2919,15 @@ impl Rex3 {
             });
         }
         self.gfifo.push(addr, val);
+        // Wake the consumer if it parked on an empty fifo (idle desktop). Cheap
+        // on the hot path: a relaxed-ish load that is false whenever the
+        // processor is actively draining.
+        #[cfg(feature = "idle-pause")]
+        if self.processor_parked.load(Ordering::Acquire) {
+            if let Some(t) = self.processor_unparker.get() {
+                t.unpark();
+            }
+        }
     }
 
     fn wait_idle(&self) {
@@ -2985,11 +3028,19 @@ impl Rex3 {
     }
 
     fn register_processor(&self) {
+        // Publish our thread handle so gfifo_push can unpark us when we park.
+        #[cfg(feature = "idle-pause")]
+        let _ = self.processor_unparker.set(thread::current());
         let backoff = crossbeam_utils::Backoff::new();
         let mut is_busy = false;
         loop {
             if let Some((addr, val)) = self.gfifo.peek() {
                 backoff.reset();
+                // Any consumed entry may have touched the framebuffer or display
+                // state; flag it so the refresh thread re-renders this frame. An
+                // idle screen leaves the fifo empty, so this stays clear and the
+                // refresh thread skips its expensive full-frame work.
+                self.fb_dirty.store(true, Ordering::Relaxed);
 
                 if !is_busy {
                     self.gfxbusy.store(true, Ordering::Relaxed);
@@ -3043,8 +3094,28 @@ impl Rex3 {
                     is_busy = false;
                 }
                 self.gfifo.flush_head();
-                // Nothing in the ring — back off. Starts with spin_loop() hints,
-                // graduates to thread::yield_now() after sustained emptiness.
+                // Nothing in the ring — back off. Spin-hint/yield while a burst
+                // might still be in flight; once emptiness is *sustained*
+                // (crossbeam's backoff completes), stop burning a host core on
+                // yield_now() and actually park. An idle IRIX desktop leaves this
+                // fifo empty indefinitely, so without parking this thread pins a
+                // CPU at ~100%.
+                #[cfg(feature = "idle-pause")]
+                if backoff.is_completed() {
+                    // Set parked BEFORE the final emptiness re-check so a racing
+                    // gfifo_push either (a) is seen by the peek below, or (b) sees
+                    // parked=true and unparks us — the unpark token makes
+                    // park_timeout return immediately, so no wakeup is lost. The
+                    // 2ms timeout is only a backstop; a missed unpark costs latency,
+                    // never correctness.
+                    self.processor_parked.store(true, Ordering::Release);
+                    if self.gfifo.peek().is_none() && self.running.load(Ordering::Relaxed) {
+                        thread::park_timeout(std::time::Duration::from_millis(2));
+                    }
+                    self.processor_parked.store(false, Ordering::Release);
+                    backoff.reset();
+                } else { backoff.snooze(); }
+                #[cfg(not(feature = "idle-pause"))]
                 backoff.snooze();
             }
         }
@@ -3169,7 +3240,7 @@ impl Rex3 {
                     let no_zpopaque = !ctx.drawmode0.zpopaque();
                     let is_src_op   = ctx.drawmode1.logicop() == DRAWMODE1_LOGICOP_SRC >> 28;
 
-                    if ctx.drawmode1.fastclear() && no_cid {
+                    if ctx.drawmode1.fastclear() && no_cid && no_host {
                         Self::process_pixel_fastclear
                     } else if no_cid && no_host && no_blend && en_z && !en_ls && no_zpopaque && is_src_op {
                         // Character/glyph: zpattern kill only, SRC logicop — no dst read needed.
@@ -3335,11 +3406,14 @@ impl Rex3 {
             Self::identity
         };
 
+        let bayer_fn: fn(u32, i32, i32) -> u32 = if rgbmode { Self::bayer_pack } else { Self::bayer_nop };
+
         unsafe {
             *self.px_rd.get() = rd;
             *self.px_wr.get() = wr;
             *self.px_amp.get() = amp;
             *self.px_logic.get() = logic_fn;
+            *self.px_bayer.get() = bayer_fn;
             *self.px_compress.get() = compress;
             *self.px_expand.get() = expand;
             self.host_setup(drawmode1);
@@ -3349,6 +3423,9 @@ impl Rex3 {
     fn refresh_loop(&self) {
         let frame_duration = std::time::Duration::from_micros(16667); // ~60Hz
         let mut status_bar = crate::disp::StatusBar::new();
+        // Idle-skip bookkeeping (see the should_render gate below).
+        let mut last_topscan: usize = usize::MAX;
+        let mut frames_since_render: u32 = u32::MAX;
 
         while self.running.load(Ordering::Relaxed) {
             let start = std::time::Instant::now();
@@ -3406,7 +3483,38 @@ impl Rex3 {
             let fb_aux = unsafe { &*self.fb_aux.get() };
             let topscan = unsafe { (*self.context.get()).topscan as usize };
 
-            {
+            // Idle skip: only run the (expensive) full-frame refresh + GL upload
+            // when something visible changed. `fb_dirty` covers all REX3 drawing
+            // (set by the gfifo consumer); the palette/cursor/mode mutexes carry
+            // their own dirty flags (peeked here, not cleared — refresh() clears
+            // them when it runs). A periodic heartbeat keeps the live status bar
+            // moving and bounds any missed-dirty staleness. VBLANK is still ticked
+            // every frame (see the else branch), independent of host rendering.
+            //
+            // The dirty mutexes are locked one at a time (separate `let`s) so we
+            // never hold two of them at once — avoids any lock-ordering hazard
+            // against the consumer/CPU threads.
+            const IDLE_HEARTBEAT_FRAMES: u32 = 6; // ≥10 Hz refresh floor when idle
+            let palette_dirty = {
+                let v = self.vc2.lock().dirty;
+                let c = self.cmap0.lock().dirty;
+                let b = self.bt445.lock().dirty;
+                let x = self.xmap0.lock().dirty;
+                v || c || b || x
+            };
+            let dbg_overlay = self.draw_debug.load(Ordering::Relaxed)
+                || self.show_cmap.load(Ordering::Relaxed)
+                || self.show_disp_debug.load(Ordering::Relaxed);
+            let should_render = self.fb_dirty.swap(false, Ordering::Acquire)
+                || palette_dirty
+                || dbg_overlay
+                || topscan != last_topscan
+                || self.screenshot_pending.load(Ordering::Relaxed)
+                || frames_since_render >= IDLE_HEARTBEAT_FRAMES;
+
+            if should_render {
+                frames_since_render = 0;
+                last_topscan = topscan;
                 self.diag.fetch_or(Self::DIAG_LOCK_SCREEN, Ordering::Relaxed);
                 let mut screen = self.screen.lock();
                 screen.topscan = topscan;
@@ -3491,6 +3599,26 @@ impl Rex3 {
                     self.diag.fetch_and(!Self::DIAG_LOOP_GL_RENDER, Ordering::Relaxed);
                 }
                 self.diag.fetch_and(!(Self::DIAG_LOCK_SCREEN | Self::DIAG_LOCK_RENDERER), Ordering::Relaxed);
+            } else {
+                // Nothing visible changed — skip the full refresh + GL upload and
+                // leave the already-presented front buffer on screen. Still tick
+                // the hardware VBLANK and latch cursor-Y every frame: the guest's
+                // vsync timing must not depend on whether the host re-rendered.
+                frames_since_render = frames_since_render.saturating_add(1);
+                self.config.status.fetch_or(STATUS_VRINT, Ordering::Relaxed);
+                {
+                    self.diag.fetch_or(Self::DIAG_LOCK_VC2, Ordering::Relaxed);
+                    let mut vc2 = self.vc2.lock();
+                    vc2.regs[crate::vc2::VC2_REG_WORKING_CURSOR_Y as usize] = vc2.regs[crate::vc2::VC2_REG_CURSOR_Y_LOC as usize];
+                    drop(vc2);
+                    self.diag.fetch_and(!Self::DIAG_LOCK_VC2, Ordering::Relaxed);
+                }
+                {
+                    self.diag.fetch_or(Self::DIAG_LOCK_VBLANK_CB, Ordering::Relaxed);
+                    let cb = self.vblank_cb.lock().clone();
+                    self.diag.fetch_and(!Self::DIAG_LOCK_VBLANK_CB, Ordering::Relaxed);
+                    if let Some(cb) = cb { cb(true); }
+                }
             }
 
             // Timing & VBLANK

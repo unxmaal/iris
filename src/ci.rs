@@ -201,7 +201,55 @@ fn dispatch(server: &CiServer, req: &Request) -> Response {
         "tree"          => cmd_tree(),
         "pull"          => cmd_pull(&req.args),
         "push"          => cmd_push(&req.args),
+        "rtc-save"      => cmd_rtc_save(server, &req.args),
+        "cdrom-eject"   => cmd_cdrom_eject(server, &req.args),
+        "cdrom-load"    => cmd_cdrom_load(server, &req.args),
         other => Response::err(format!("unknown command: {}", other)),
+    }
+}
+
+fn cmd_rtc_save(server: &CiServer, args: &Value) -> Response {
+    let explicit_path = args.get("path").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let result = server.with_machine(|m| {
+        let rtc = m.hpc3().rtc();
+        let path = explicit_path.clone().unwrap_or_else(|| rtc.nvram_path().to_string());
+        rtc.save_nvram(&path).map(|_| path)
+    });
+    match result {
+        Ok(path) => Response::data(serde_json::json!({ "path": path })),
+        Err(e) => Response::err(format!("rtc-save: {}", e)),
+    }
+}
+
+fn cmd_cdrom_eject(server: &CiServer, args: &Value) -> Response {
+    let id = match args.get("id").and_then(|v| v.as_u64()) {
+        Some(n) => n as usize,
+        None => return Response::err("cdrom-eject: missing 'id' arg"),
+    };
+    let result = server.with_machine(|m| {
+        m.hpc3().scsi().eject_disc(id)
+    });
+    match result {
+        Ok(path) => Response::data(serde_json::json!({ "id": id, "new_disc": path })),
+        Err(e) => Response::err(format!("cdrom-eject: {}", e)),
+    }
+}
+
+fn cmd_cdrom_load(server: &CiServer, args: &Value) -> Response {
+    let id = match args.get("id").and_then(|v| v.as_u64()) {
+        Some(n) => n as usize,
+        None => return Response::err("cdrom-load: missing 'id' arg"),
+    };
+    let path = match args.get("path").and_then(|v| v.as_str()) {
+        Some(p) => p.to_string(),
+        None => return Response::err("cdrom-load: missing 'path' arg"),
+    };
+    let result = server.with_machine(|m| {
+        m.hpc3().scsi().load_disc(id, path.clone())
+    });
+    match result {
+        Ok(loaded) => Response::data(serde_json::json!({ "id": id, "disc": loaded })),
+        Err(e) => Response::err(format!("cdrom-load: {}", e)),
     }
 }
 
@@ -212,7 +260,12 @@ fn cmd_quit() -> Response {
         if let Some(p) = SOCKET_PATH.lock().take() {
             let _ = std::fs::remove_file(&p);
         }
-        std::process::exit(0);
+        // Same escape hatch as the PowerOff handler: library hosts set
+        // IRIS_NO_EXIT_ON_POWEROFF=1 so a `quit` over the CI socket does
+        // not kill the embedder.
+        if std::env::var_os("IRIS_NO_EXIT_ON_POWEROFF").is_none() {
+            std::process::exit(0);
+        }
     });
     Response::ok()
 }
@@ -451,17 +504,24 @@ fn cmd_wait_serial(server: &CiServer, args: &Value) -> Response {
 //
 // The scratch device is a raw SCSI LUN (`scratch = true` in iris.toml).
 // iris pre-formats the underlying file with a minimal SGI Volume Header at
-// sector 0 so IRIX recognises it (without the VH, /dev/rdsk/dks0dNvol
-// returns I/O error on every read). The VH defines partition slot 7
-// ("vol") spanning sectors 8..end and slot 8 ("vh") spanning sectors 0..7.
+// sector 0 so IRIX recognises it (without the VH, /dev/rdsk/dks0dN*
+// returns I/O error on every read). The VH defines three partitions
+// (see src/sgi_vh.rs):
+//   - slot  0 ("s0",  payload):     PT_RAW,    sectors 8..end
+//   - slot  8 ("vh",  volhdr):      PT_VOLHDR, sectors 0..7
+//   - slot 10 ("vol", whole-disk):  PT_VOLUME, sectors 0..end
 //
 // Wire convention:
 //   - `scratch-write` and `scratch-read` operate on the *payload* area —
 //     `offset = 0` means the first byte after the VH (raw byte 4096 in the
 //     underlying file). The VH is never touched by these commands.
-//   - The guest reads the same payload at offset 0 of /dev/rdsk/dks0dNvol
-//     because partition 7's first_block = 8.
-//   - Typical guest read: `dd if=/dev/rdsk/dks0d2vol bs=64k | tar xf -`.
+//   - The guest reads/writes the same payload at offset 0 of
+//     /dev/rdsk/dks0dNs0 (NOT /dev/rdsk/dks0dNvol — that one starts at
+//     sector 0 and so begins with the volume header itself; writing to it
+//     also clobbers the VH so future scratch ops misalign).
+//   - Typical guest read:  `dd if=/dev/rdsk/dks0d2s0 bs=64k | tar xf -`.
+//   - Typical guest write: `dd if=mydata of=/dev/rdsk/dks0d2s0 bs=512 conv=sync`
+//     (sector-aligned; conv=sync zero-pads the trailing partial sector).
 //
 // Each scratch op briefly stops the machine to quiesce in-flight SCSI I/O
 // (Machine::with_paused). The CPU is restarted only if it was running before

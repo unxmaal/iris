@@ -6,7 +6,7 @@
 //! state should produce bit-identical CPU registers — any divergence points
 //! at non-determinism in `load_snapshot` (host wallclock leakage, missing
 //! `load_state` field, uninitialised structure) that would silently corrupt
-//! mogrix CI replays.
+//! CI replays.
 //!
 //! With JIT descoped (Phase 2.5), the original "JIT vs interp lockstep"
 //! framing is gone; this is the snapshot-determinism portion. Peripheral

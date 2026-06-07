@@ -10,6 +10,42 @@ use crate::snapshot::{get_field, toml_u8, toml_bool, u8_slice_to_toml, load_u8_s
 use crate::scsi::{self, ScsiDevice, scsi_cmd, ScsiRequest, ScsiDataLength};
 use std::io::Write;
 
+// Ring-buffer trace of WD33C93 register accesses with consecutive-dedup, so
+// long polling loops compress to one "(x N)" line and the ring covers a much
+// wider window of activity.
+pub static WDT_SEQ: AtomicU64 = AtomicU64::new(0);
+pub struct WdtRing {
+    entries: VecDeque<(u64, String, u64)>,   // (first_seq, message, repeat_count)
+}
+pub static WDT_RING: parking_lot::Mutex<WdtRing> = parking_lot::Mutex::new(WdtRing { entries: VecDeque::new() });
+const WDT_RING_CAP: usize = 4000;
+
+pub fn wdt_log(args: std::fmt::Arguments<'_>) {
+    let n = WDT_SEQ.fetch_add(1, Ordering::Relaxed);
+    let msg = format!("{}", args);
+    let mut ring = WDT_RING.lock();
+    if let Some(last) = ring.entries.back_mut() {
+        if last.1 == msg {
+            last.2 += 1;
+            return;
+        }
+    }
+    if ring.entries.len() >= WDT_RING_CAP { ring.entries.pop_front(); }
+    ring.entries.push_back((n, msg, 1));
+}
+
+pub fn wdt_dump_tail() {
+    let ring = WDT_RING.lock();
+    for (seq, msg, cnt) in ring.entries.iter() {
+        if *cnt == 1 {
+            eprintln!("WDT {:8} {}", seq, msg);
+        } else {
+            eprintln!("WDT {:8} {}   (x{})", seq, msg, cnt);
+        }
+    }
+    eprintln!("WDT_DUMP_END (total_seen={})", WDT_SEQ.load(Ordering::Relaxed));
+}
+
 // Indirect Register Addresses (accessed via AR)
 pub mod regs {
     pub const OWN_ID: u8 = 0x00;
@@ -187,6 +223,11 @@ struct Wd33c93aState {
 
 pub trait ScsiCallback: Send + Sync {
     fn set_interrupt(&self, level: bool);
+    /// Drop any pending PDMA-side SCSI completion bit.  Called when the chip
+    /// itself signals "done" to the kernel (kernel reads SCSI_STATUS / clears
+    /// ASR.INT) — on real HPC3 the SCSI INT3 source is shared and the kernel
+    /// only acks once at the chip level.  Default = no-op for non-HPC3 wirings.
+    fn clear_pdma_int(&self) {}
 }
 
 pub struct Wd33c93a {
@@ -251,7 +292,51 @@ impl Wd33c93a {
         use crate::cow_disk::CowDisk;
         use crate::scsi::DiskBackend;
 
-        let (backend, size) = if overlay && !is_cdrom {
+        // Empty CD-ROM (drive present, tray empty). Stored backend=None so
+        // TEST UNIT READY / READ CAPACITY / READ return MEDIUM NOT PRESENT,
+        // while INQUIRY still advertises the drive. Use insert_disc() to
+        // mount media later.
+        if is_cdrom && path.is_empty() {
+            let mut state = self.state.lock();
+            if id < 8 {
+                state.devices[id] = Some(crate::scsi::ScsiDevice::new_empty_cdrom());
+            }
+            return Ok(());
+        }
+
+        #[cfg(feature = "chd")]
+        let is_chd_path = crate::chd_disk::is_chd(path);
+        #[cfg(not(feature = "chd"))]
+        let is_chd_path = {
+            let p = path.to_ascii_lowercase();
+            p.ends_with(".chd")
+        };
+
+        let (backend, size) = if is_chd_path {
+            #[cfg(feature = "chd")]
+            {
+                use crate::chd_disk::{ChdCd, ChdHd};
+                if is_cdrom {
+                    let cd = ChdCd::open(path)?;
+                    let sz = cd.size();
+                    (DiskBackend::ChdCd(cd), sz)
+                } else {
+                    // HD CHDs are inherently writable via the libchdman-rs HdImage
+                    // surface (in-place for uncompressed, diff sidecar for
+                    // compressed), so the `overlay` flag is not applicable here.
+                    let hd = ChdHd::open(path)?;
+                    let sz = hd.size();
+                    (DiskBackend::ChdHd(hd), sz)
+                }
+            }
+            #[cfg(not(feature = "chd"))]
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "CHD image support not compiled in (rebuild with --features chd)",
+                ));
+            }
+        } else if overlay && !is_cdrom {
             let overlay_path = overlay_path_override
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| format!("{}.overlay", path));
@@ -276,6 +361,29 @@ impl Wd33c93a {
         Ok(())
     }
 
+    /// Mount media on a CD-ROM device (newly inserts or swaps existing).
+    /// Errors if the slot is empty, is not a CD-ROM, or the file can't open.
+    pub fn insert_disc(&self, id: usize, path: &str) -> Result<(), String> {
+        let mut state = self.state.lock();
+        match state.devices.get_mut(id).and_then(|d| d.as_mut()) {
+            None => Err(format!("No device at SCSI ID {}", id)),
+            Some(dev) if !dev.is_cdrom() => Err(format!("SCSI ID {} is not a CD-ROM", id)),
+            Some(dev) => dev.insert_media(path).map_err(|e| format!("insert_disc: {}", e)),
+        }
+    }
+
+    /// Unload media from a CD-ROM (leave the drive present but empty).
+    /// Use this when you want "drive present, no disc" rather than the
+    /// changer-cycle behaviour of `eject_disc`.
+    pub fn eject_to_empty(&self, id: usize) -> Result<(), String> {
+        let mut state = self.state.lock();
+        match state.devices.get_mut(id).and_then(|d| d.as_mut()) {
+            None => Err(format!("No device at SCSI ID {}", id)),
+            Some(dev) if !dev.is_cdrom() => Err(format!("SCSI ID {} is not a CD-ROM", id)),
+            Some(dev) => { dev.unload_media(); Ok(()) }
+        }
+    }
+
     /// Eject the current disc on a CD-ROM device and advance to the next in
     /// the changer list.  Returns the new active path, or an error string.
     pub fn eject_disc(&self, id: usize) -> Result<String, String> {
@@ -289,6 +397,16 @@ impl Wd33c93a {
                     format!("SCSI ID {} has only one disc (nothing to eject to)", id)
                 }
             }),
+        }
+    }
+
+    /// Load an arbitrary image path into a CD-ROM device and make it the active
+    /// disc immediately (medium change). Returns the loaded path.
+    pub fn load_disc(&self, id: usize, path: String) -> Result<String, String> {
+        let mut state = self.state.lock();
+        match state.devices.get_mut(id).and_then(|d| d.as_mut()) {
+            None => Err(format!("No device at SCSI ID {}", id)),
+            Some(dev) => dev.load_disc(path),
         }
     }
 
@@ -400,7 +518,7 @@ impl Wd33c93a {
 
     pub fn read(&self, addr: u32) -> BusRead8 {
         let mut state = self.state.lock();
-        
+
         if addr == 0 {
             // Read ASR (Auxiliary Status Register)
             let mut val = state.asr;
@@ -410,6 +528,9 @@ impl Wd33c93a {
                 val |= asr::DBR;
             }
 
+            wdt_log(format_args!("R ASR -> {:02x} (phase={:02x} stat={:02x})",
+                val, state.regs[regs::COMMAND_PHASE as usize],
+                state.regs[regs::SCSI_STATUS as usize]));
             if state.last_read_asr.is_none() || state.last_read_asr.unwrap() != val {
                 dlog!(LogModule::Scsi, "WD33C93A: Read ASR -> {:02x}", val);
                 state.last_read_asr = Some(val);
@@ -419,9 +540,11 @@ impl Wd33c93a {
         } else if addr == 1 {
             // Read register pointed to by AR
             let ar = state.ar & 0x1F;
-            
+
             if ar == regs::DATA {
                 let val = state.fifo.pop_front().unwrap_or(0);
+                wdt_log(format_args!("R FIFO -> {:02x} (fifo_remaining={})",
+                    val, state.fifo.len()));
                 dlog!(LogModule::Scsi, "WD33C93A: Read FIFO -> {:02x}", val);
                 state.last_read_asr = None;
                 state.last_read_reg = None;
@@ -438,15 +561,31 @@ impl Wd33c93a {
 
             let val = state.regs[ar as usize];
 
-            // Reading SCSI Status (0x17) clears the interrupt bit in ASR
+            // Reading SCSI Status (0x17) clears the interrupt bit in ASR.
+            // On the real WD33C93 + HPC3 pair, the SCSI ISR also implicitly
+            // acks any pending PDMA SCSI0_DMA completion — both halves of the
+            // SCSI line share the same INT3 source and the chip-INT ack settles
+            // the line for both.  Without that coupling here, the PDMA bit
+            // stays asserted forever once the chip-INT is cleared, IP2 storms,
+            // and the IRIX 6.5 miniroot stalls.
             if ar == regs::SCSI_STATUS {
                 if (state.asr & asr::INT) != 0 {
                     state.asr &= !asr::INT;
                     if let Some(cb) = &self.callback {
                         cb.set_interrupt(false);
+                        // Also drop any lingering PDMA DMA-IRQ: the chip's
+                        // ack on the IOC SCSI0 line is also the kernel's
+                        // global ack for this SCSI transaction.
+                        cb.clear_pdma_int();
                     }
                 }
             }
+
+            wdt_log(format_args!("R REG[{:02x}] -> {:02x} (phase={:02x} stat={:02x} asr_after={:02x})",
+                ar, val,
+                state.regs[regs::COMMAND_PHASE as usize],
+                state.regs[regs::SCSI_STATUS as usize],
+                state.asr));
 
             // Auto-increment for registers except COMMAND (0x18), DATA (0x19), AUX_STATUS (0x1F)
             if ar != regs::COMMAND && ar != regs::AUX_STATUS_DIRECT {
@@ -482,6 +621,7 @@ impl Wd33c93a {
         if addr == 0 {
             // Write AR (Address Register)
             state.ar = val & 0x1F;
+            wdt_log(format_args!("W AR  <- {:02x}", val));
             dlog!(LogModule::Scsi, "WD33C93A: Write AR <- {:02x}", val);
             state.last_read_asr = None;
             state.last_read_reg = None;
@@ -490,6 +630,16 @@ impl Wd33c93a {
             // Write register pointed to by AR
             let ar = state.ar & 0x1F;
 
+            {
+                let label = match ar {
+                    regs::DATA => "DATA",
+                    regs::COMMAND => "COMMAND",
+                    regs::AUX_STATUS_DIRECT => "ASR_DIR",
+                    _ => "REG",
+                };
+                wdt_log(format_args!("W {}[{:02x}] <- {:02x} (phase={:02x})",
+                    label, ar, val, state.regs[regs::COMMAND_PHASE as usize]));
+            }
             dlog!(LogModule::Scsi, "WD33C93A: Write Reg {:02x} <- {:02x}", ar, val);
             state.last_read_asr = None;
             state.last_read_reg = None;
@@ -511,7 +661,7 @@ impl Wd33c93a {
                 // Auto-increment for registers except COMMAND, DATA, AUX_STATUS
                 state.ar = (ar + 1) & 0x1F;
             }
-            
+
             return BUS_OK;
         }
         BUS_ERR
@@ -554,35 +704,38 @@ impl Device for Wd33c93a {
         *self.thread.lock() = Some(thread::Builder::new().name("WD33C93A".to_string()).spawn(move || {
             let mut state_guard = state.lock();
             while running.load(Ordering::Relaxed) {
-                cond.wait(&mut state_guard);
+                // Wait for a pending command — re-check the predicate every wake
+                // to avoid the parking_lot::Condvar::notify_one lost-wakeup race:
+                // if write_command sets has_pending_command and notifies between
+                // the previous process_wd_command finishing and the next cond.wait,
+                // the bare `cond.wait` form drops the wake-up and the command stalls.
+                while !state_guard.has_pending_command && running.load(Ordering::Relaxed) {
+                    cond.wait(&mut state_guard);
+                }
                 if !running.load(Ordering::Relaxed) { break; }
 
-                // Check for Command Register write
-                if state_guard.has_pending_command {
-                    let cmd_reg = state_guard.regs[regs::COMMAND as usize];
-                    state_guard.has_pending_command = false;
-                    dlog!(LogModule::Scsi, "WD33C93A: Processing Command {:02x}", cmd_reg);
-                    state_guard.regs[regs::COMMAND as usize] = 0; // Clear command register
-                    drop(state_guard); // Drop lock before processing to allow re-entry if needed (though we need state access)
+                let cmd_reg = state_guard.regs[regs::COMMAND as usize];
+                state_guard.has_pending_command = false;
+                dlog!(LogModule::Scsi, "WD33C93A: Processing Command {:02x}", cmd_reg);
+                state_guard.regs[regs::COMMAND as usize] = 0;
 
-                    let mut state = state.lock();
-                    state.process_wd_command(cmd_reg, dma.as_deref());
+                // Drop the lock before process_wd_command — it calls into PDMA
+                // (dma_write) which locks PdmaChannel; keeping wd33c93 state held
+                // across that path risks lock-order inversion with other threads.
+                drop(state_guard);
+                let mut state2 = state.lock();
+                state2.process_wd_command(cmd_reg, dma.as_deref());
 
-                    // Signal SCSI activity heartbeat (IDs 0-6; 7 is host, skip).
-                    let tid = state.target_id;
-                    if tid < 7 {
-                        heartbeat.fetch_or(1u64 << (crate::rex3::Rex3::HB_SCSI_BASE as u64 + tid as u64), Ordering::Relaxed);
-                    }
-
-                    // Update interrupt state
-                    let int_active = (state.asr & asr::INT) != 0;
-                    if let Some(cb) = &callback {
-                        cb.set_interrupt(int_active);
-                    }
-
-                    // Re-assign state_guard for next iteration
-                    state_guard = state;
+                let tid = state2.target_id;
+                if tid < 7 {
+                    heartbeat.fetch_or(1u64 << (crate::rex3::Rex3::HB_SCSI_BASE as u64 + tid as u64), Ordering::Relaxed);
                 }
+
+                let int_active = (state2.asr & asr::INT) != 0;
+                if let Some(cb) = &callback {
+                    cb.set_interrupt(int_active);
+                }
+                state_guard = state2;
             }
         }).unwrap());
     }
@@ -599,6 +752,18 @@ impl Device for Wd33c93a {
     fn execute_command(&self, cmd: &str, args: &[&str], mut writer: Box<dyn Write + Send>) -> Result<(), String> {
         if cmd == "scsi" {
             match args.first().copied() {
+                Some("wdt") => {
+                    let ring = WDT_RING.lock();
+                    for (seq, msg, cnt) in ring.entries.iter() {
+                        if *cnt == 1 {
+                            writeln!(writer, "WDT {:8} {}", seq, msg).unwrap();
+                        } else {
+                            writeln!(writer, "WDT {:8} {}   (x{})", seq, msg, cnt).unwrap();
+                        }
+                    }
+                    writeln!(writer, "(total_seen={})", WDT_SEQ.load(Ordering::Relaxed)).unwrap();
+                    return Ok(());
+                }
                 Some("debug") => {
                     let val = match args.get(1).copied() {
                         Some("on")  => true,

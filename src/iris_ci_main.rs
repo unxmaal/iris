@@ -168,6 +168,18 @@ enum Cmd {
 
     /// Run a sequence of iris-ci commands from a file (one per line, # comments).
     Script { path: PathBuf },
+
+    /// Persist the emulated DS1386 NVRAM/RTC state to a file (default nvram.bin).
+    RtcSave {
+        #[arg(long)]
+        path: Option<String>,
+    },
+
+    /// Cycle the CD changer on a SCSI ID to the next disc.
+    CdromEject { id: u64 },
+
+    /// Load an arbitrary CD image into a SCSI ID and make it the active disc.
+    CdromLoad { id: u64, path: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -267,6 +279,16 @@ fn dispatch(opts: &Opts, cmd: Cmd) -> Result<()> {
         Cmd::Push { url, name } => cmd_push(opts, &url, &name),
 
         Cmd::Script { path } => cmd_script(opts, &path),
+
+        Cmd::RtcSave { path } => {
+            let args = match path {
+                Some(p) => json!({"path": p}),
+                None => json!({}),
+            };
+            simple(opts, "rtc-save", args, "nvram saved")
+        }
+        Cmd::CdromEject { id } => simple(opts, "cdrom-eject", json!({"id": id}), "ejected"),
+        Cmd::CdromLoad { id, path } => simple(opts, "cdrom-load", json!({"id": id, "path": path}), "loaded"),
     }
 }
 
@@ -545,6 +567,38 @@ fn run_capture(opts: &Opts, command: &str, shell: &str, timeout_ms: u64) -> Resu
     Ok((stdout, rc))
 }
 
+/// Detect the guest's interactive login shell so `get`/`put` use redirect +
+/// rc-marker syntax that actually parses there. Historically IRIX root ran csh
+/// (`>&`, `$status`); some installs (e.g. the klindert 6.5 disk) switch root to
+/// `/bin/sh` (`2>&1`, `$?`), where the csh forms fail ("bad file unit number")
+/// and the rc marker comes back empty. `$0` expands to the shell in both, so
+/// probe it with a self-chosen sentinel (no rc marker, so it can't itself depend
+/// on the shell). Defaults to csh on any ambiguity (the historical assumption).
+fn detect_guest_shell(opts: &Opts) -> &'static str {
+    const SENTINEL: &str = "ZZSHELLZZ=";
+    let _ = send(opts, "serial-read", json!({}));
+    if send(opts, "serial-send", json!({"data": format!("echo {}$0\r", SENTINEL)})).is_err() {
+        return "csh";
+    }
+    // Wait for the value line (the typed echo also contains the sentinel; read a
+    // bit more so the rsplit lands on the command's actual output).
+    let _ = send(opts, "wait-serial", json!({"pattern": SENTINEL, "timeout_ms": 8000}));
+    std::thread::sleep(Duration::from_millis(250));
+    let more = send(opts, "serial-read", json!({})).ok();
+    let buf = more.as_ref().and_then(|v| v.as_str()).unwrap_or("");
+    let val = buf.rsplit(SENTINEL).next().unwrap_or("");
+    // `$0` is e.g. "-sh", "/bin/sh", "/bin/csh", "-csh", "tcsh".
+    if val.contains("csh") { "csh" } else if val.contains("sh") { "sh" } else { "csh" }
+}
+
+/// Shell-specific "discard stdout+stderr" suffix.
+fn devnull_redirect(shell: &str) -> &'static str {
+    match shell {
+        "sh" | "bash" | "ksh" => "> /dev/null 2>&1",
+        _ => ">& /dev/null", // csh / tcsh
+    }
+}
+
 /// Send a command, wait for a sentinel, print stdout, fail on non-zero exit.
 /// csh: appends `; echo IRIS-CI-RC=$status`. sh: appends `; echo IRIS-CI-RC=$?`.
 fn cmd_run(opts: &Opts, command: &str, shell: &str, timeout_ms: u64) -> Result<()> {
@@ -639,24 +693,28 @@ fn cmd_put(opts: &Opts, host_path: &std::path::Path, to: Option<&str>, timeout_m
     }
 
     // 2. Drive the guest to read exactly the right number of 512-byte sectors.
-    //    Use `>&` for combined stderr+stdout (csh syntax — `2>&1` is sh-only).
-    //    cmd_run wraps with `; echo IRIS-CI-RC=$status` itself.
+    //    Redirect + rc-marker syntax must match the guest's actual login shell
+    //    (csh `>&`/`$status` vs sh `2>&1`/`$?`), or the command errors ("bad file
+    //    unit number") / the rc comes back empty. cmd_run appends the marker.
+    let shell = detect_guest_shell(opts);
+    let nul = devnull_redirect(shell);
     let sectors = (bytes.len() as u64).div_ceil(512);
     let dd_cmd = format!(
-        "dd if=/dev/rdsk/dks0d2s0 of={} bs=512 count={} >& /dev/null",
-        guest_path, sectors
+        "dd if=/dev/rdsk/dks0d2s0 of={} bs=512 count={} {}",
+        guest_path, sectors, nul
     );
-    cmd_run(opts, &dd_cmd, "csh", timeout_ms)?;
+    cmd_run(opts, &dd_cmd, shell, timeout_ms)?;
 
     // 3. Truncate the guest file to the original byte length (dd reads in
     //    sector multiples, so a 28-byte input becomes 512 bytes on the guest).
     //    `dd of=FILE bs=1 seek=N count=0` is POSIX and IRIX-clean.
     let dd_trunc = format!(
-        "dd if=/dev/null of={} bs=1 seek={} count=0 >& /dev/null",
+        "dd if=/dev/null of={} bs=1 seek={} count=0 {}",
         guest_path,
-        bytes.len()
+        bytes.len(),
+        nul
     );
-    cmd_run(opts, &dd_trunc, "csh", 10_000)?;
+    cmd_run(opts, &dd_trunc, shell, 10_000)?;
 
     if !opts.quiet {
         eprintln!("put: {} → {} ({} bytes)", host_path.display(), guest_path, bytes.len());
@@ -681,20 +739,22 @@ fn cmd_get(opts: &Opts, guest_path: &str, to: Option<&std::path::Path>, timeout_
     send(opts, "scratch-clear", json!({}))?;
 
     // 2. Drive the guest to write the file to scratch with conv=sync padding.
-    //    csh redirect syntax: `>&` for stdout+stderr. cmd_run adds the
-    //    rc-marker echo itself.
+    //    Redirect + rc-marker syntax must match the guest's login shell (csh
+    //    `>&`/`$status` vs sh `2>&1`/`$?`). cmd_run adds the rc-marker echo.
+    let shell = detect_guest_shell(opts);
+    let nul = devnull_redirect(shell);
     let dd_cmd = format!(
-        "dd if={} of=/dev/rdsk/dks0d2s0 bs=512 conv=sync,notrunc >& /dev/null",
-        guest_path
+        "dd if={} of=/dev/rdsk/dks0d2s0 bs=512 conv=sync,notrunc {}",
+        guest_path, nul
     );
-    cmd_run(opts, &dd_cmd, "csh", timeout_ms)?;
+    cmd_run(opts, &dd_cmd, shell, timeout_ms)?;
 
     // 3. Look up the guest file size so we know how much to slice off the
     //    scratch payload (which is now padded to a 512-byte boundary). Use
     //    a pure-shell approach: `wc -c` outputs just the byte count.
     //    `awk` is also available but `wc -c` is simpler to parse.
     let stat_cmd = format!("wc -c < {}", guest_path);
-    let (stat_stdout, stat_rc) = run_capture(opts, &stat_cmd, "csh", 10_000)?;
+    let (stat_stdout, stat_rc) = run_capture(opts, &stat_cmd, shell, 10_000)?;
     if stat_rc != 0 {
         return Err(Error::Iris(format!(
             "guest stat of {} failed (exit {})", guest_path, stat_rc

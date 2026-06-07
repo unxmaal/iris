@@ -12,11 +12,11 @@ Every snapshot saved by Phase 1+ writes a `snapshot.toml` at the top of `saves/<
 schema_version = 1            # u32, current = 1
 host_arch = "aarch64"         # std::env::consts::ARCH at save time
 created_at_unix = 1777764190  # u64 unix seconds
-installed_bundles = []        # Vec<String>; populated by mogrix tooling
+installed_bundles = []        # Vec<String>; names of software bundles installed in this image
 # optional:
 iris_git_rev = "abc123"       # from option_env!("IRIS_GIT_REV") at build time
 parent = "base/desktop"       # name of the snapshot we restored from before this save
-description = "post-mogrix"   # free-form note
+description = "post-install"  # free-form note
 ```
 
 ## Load behavior (`src/machine.rs:633` `load_snapshot`)

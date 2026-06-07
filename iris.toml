@@ -17,13 +17,23 @@ prom = "prom.bin"
 # scale=2 is visibly ~2× bigger than scale=1 on every display.
 # Valid: 1, 2, 3, or 4.
 # Can also be set with the --2x command-line flag (CLI takes precedence).
-scale = 2
+scale = 1
+
+# Scroll wheel sensitivity: pixels of trackpad/wheel movement per PS/2 detent.
+# Lower = faster scroll; higher = slower. Tune to taste for your hardware.
+# 40 works well for most Linux trackpads; try 80–120 if scroll is too fast.
+#mouse_scroll_pixels_per_line = 40
 
 # RAM bank sizes in MB.
 # Each bank must be 0 (absent), 8, 16, 32, 64, or 128.
 # The SGI Indy supports up to two populated banks; banks 2 and 3 are
 # typically absent.  Total RAM = sum of non-zero banks.
 banks = [128, 128, 0, 0]
+
+# NAT subnet for the internal network (CIDR notation).
+# The gateway gets host .1 and IRIX gets host .2.
+# Change this if 192.168.0.x conflicts with your local network.
+#nat_subnet = "192.168.5.0/24"
 
 # SCSI devices.
 # Valid IDs: 1–7.  The SCSI controller itself occupies ID 0.
@@ -34,9 +44,9 @@ banks = [128, 128, 0, 0]
 
 # Internal hard disk
 [scsi.1]
-path   = "irix65_4g.raw"
+path   = "scsi1.raw"
 cdrom  = false
-overlay = true
+#overlay = true
 
 # Internal hard disk
 #[scsi.2]
@@ -60,19 +70,24 @@ overlay = true
 # Implies cdrom=false, overlay=false (the volume must be host-writable, and
 # scratch contents intentionally survive snapshot rollback so a freshly
 # injected bundle isn't reverted).
-[scsi.2]
-path    = "scratch.raw"
-cdrom   = false
-overlay = false
-scratch = true
-size_mb = 64
+#[scsi.2]
+#path    = "scratch.raw"
+#cdrom   = false
+#overlay = false
+#scratch = true
+#size_mb = 64
+
+# NAT subnet for the internal network (CIDR notation).
+# The gateway gets host .1 and IRIX gets host .2.
+# Change this if 192.168.0.x conflicts with your local network.
+#nat_subnet = "192.168.0.0/24"
 
 # NFS share — requires unfsd on the host.
-# The shared directory is exported to the VM at 192.168.0.1:/path (standard NFS port 2049).
-# From IRIX: mount 192.168.0.1:/absolute/path /mnt
-[nfs]
-shared_dir = "./shared"
-unfsd = "/usr/local/sbin/unfsd"
+# The shared directory is exported to the VM at <gateway_ip>:/path (standard NFS port 2049).
+# From IRIX: mount <gateway_ip>:/absolute/path /mnt  (default gateway: 192.168.0.1)
+#[nfs]
+#shared_dir = "./shared"
+#unfsd = "/usr/local/sbin/unfsd"
 
 # Port forwarding rules — forward host ports into the guest (IRIX).
 # proto:      "tcp" or "udp"
@@ -108,4 +123,7 @@ bind       = "localhost"
 #[scsi.4]
 #path   = "cdrom4.iso"
 #cdrom  = true
-##discs = ["second.iso", "cdrom4.iso", "patches.iso"]
+#discs = ["second.iso", "cdrom4.iso", "patches.iso"]
+
+#[vino]
+#source = "camera"

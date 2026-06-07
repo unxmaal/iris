@@ -14,12 +14,12 @@ mod tests {
         assert!(!entry.is_global());
 
         // Set valid bit on even page
-        entry.entry_lo0 = 0x2; // V bit
+        entry.entry_lo[0] = 0x2; // V bit
         assert!(entry.is_valid_even());
         assert!(!entry.is_valid_odd());
 
         // Set valid bit on odd page
-        entry.entry_lo1 = 0x2; // V bit
+        entry.entry_lo[1] = 0x2; // V bit
         assert!(entry.is_valid_odd());
 
         // Set global bit (stored in EntryHi bit 12 per MIPS R4000 spec)
@@ -92,11 +92,11 @@ mod tests {
 
         // Even Page (Lo0): PFN 0x50, Cacheable, Dirty, Valid
         // Maps 0x00200000 -> 0x00050000
-        entry.entry_lo0 = (0x50 << 6) | (3 << 3) | (1 << 2) | (1 << 1);
+        entry.entry_lo[0] = (0x50 << 6) | (3 << 3) | (1 << 2) | (1 << 1);
 
         // Odd Page (Lo1): PFN 0x51, Uncached, Not Dirty, Valid
         // Maps 0x00201000 -> 0x00051000
-        entry.entry_lo1 = (0x51 << 6) | (2 << 3) | (0 << 2) | (1 << 1);
+        entry.entry_lo[1] = (0x51 << 6) | (2 << 3) | (0 << 2) | (1 << 1);
 
         // Write to index 5
         tlb.write(5, entry);
@@ -156,11 +156,11 @@ mod tests {
 
         // Even Page (Lo0): PFN 0x60, Cacheable, Dirty, Valid
         // Maps 0x00400000 -> 0x00060000
-        entry.entry_lo0 = (0x60 << 6) | (3 << 3) | (1 << 2) | (1 << 1);
+        entry.entry_lo[0] = (0x60 << 6) | (3 << 3) | (1 << 2) | (1 << 1);
 
         // Odd Page (Lo1): PFN 0x61, Cacheable, Dirty, Valid
         // Maps 0x00401000 -> 0x00061000
-        entry.entry_lo1 = (0x61 << 6) | (3 << 3) | (1 << 2) | (1 << 1);
+        entry.entry_lo[1] = (0x61 << 6) | (3 << 3) | (1 << 2) | (1 << 1);
 
         // Write to index 10
         tlb.write(10, entry);
@@ -199,11 +199,11 @@ mod tests {
 
         // Test EntryLo PFN is 24 bits (bits 29:6)
         // Set PFN to max value (0xFFFFFF), C=3, D=1, V=1, G=1
-        entry.entry_lo0 = (0xFFFFFF << 6) | (3 << 3) | 0x7;
-        assert_eq!(entry.entry_lo0 & 0x3FFFFFFF, entry.entry_lo0);
+        entry.entry_lo[0] = (0xFFFFFF << 6) | (3 << 3) | 0x7;
+        assert_eq!(entry.entry_lo[0] & 0x3FFFFFFF, entry.entry_lo[0]);
 
         // Verify PFN extraction
-        let pfn = (entry.entry_lo0 >> 6) & 0xFFFFFF;
+        let pfn = (entry.entry_lo[0] >> 6) & 0xFFFFFF;
         assert_eq!(pfn, 0xFFFFFF);
 
         // Test PageMask is only bits 24:13
@@ -221,8 +221,8 @@ mod tests {
         let mut entry = TlbEntry::new();
         entry.page_mask = 0;
         entry.entry_hi = (2u64 << 62) | (0x100 << 13) | (asid as u64);
-        entry.entry_lo0 = (0x50 << 6) | (3 << 3) | 0x6; // PFN 0x50, Cacheable, Dirty, Valid
-        entry.entry_lo1 = (0x51 << 6) | (2 << 3) | 0x2; // PFN 0x51, Uncached, Valid
+        entry.entry_lo[0] = (0x50 << 6) | (3 << 3) | 0x6; // PFN 0x50, Cacheable, Dirty, Valid
+        entry.entry_lo[1] = (0x51 << 6) | (2 << 3) | 0x2; // PFN 0x51, Uncached, Valid
 
         tlb.write(5, entry);
 
@@ -264,7 +264,7 @@ mod tests {
         let mut entry = TlbEntry::new();
         entry.page_mask = 0;
         entry.entry_hi = (2u64 << 62) | (0x100 << 13) | (asid as u64);
-        entry.entry_lo0 = (0x50 << 6) | (3 << 3) | 0x6;
+        entry.entry_lo[0] = (0x50 << 6) | (3 << 3) | 0x6;
 
         tlb.write(5, entry);
 
@@ -289,23 +289,30 @@ mod tests {
     /// that save_state writes.
     #[test]
     fn save_load_round_trip() {
-        let mut src = MipsTlb::new(TLB_NUM_ENTRIES);
-        // Write a few entries with varied bit patterns so we're not just
-        // testing all-zero defaults.
-        for (slot, vpn2) in [(0usize, 0x100u64), (5, 0x800), (17, 0x4000), (47, 0xffff)].iter().copied() {
-            let mut e = TlbEntry::new();
-            e.page_mask = (slot as u64) << 13;
-            e.entry_hi  = (2u64 << 62) | (vpn2 << 13) | (slot as u64 & 0xff);
-            e.entry_lo0 = ((slot as u64) << 6) | (3 << 3) | 0x6;
-            e.entry_lo1 = ((slot as u64 + 1) << 6) | (3 << 3) | 0x6;
-            src.write(slot, e);
-        }
-        let v1 = src.save_state();
+        // MipsTlb contains a 512KB vmap array; two instances exceed the default
+        // test thread stack (8KB on Linux), so run the body in a larger thread.
+        std::thread::Builder::new()
+            .stack_size(4 * 1024 * 1024)
+            .spawn(|| {
+                let mut src = MipsTlb::new(TLB_NUM_ENTRIES);
+                for (slot, vpn2) in [(0usize, 0x100u64), (5, 0x800), (17, 0x4000), (47, 0xffff)].iter().copied() {
+                    let mut e = TlbEntry::new();
+                    e.page_mask = (slot as u64) << 13;
+                    e.entry_hi  = (2u64 << 62) | (vpn2 << 13) | (slot as u64 & 0xff);
+                    e.entry_lo[0] = ((slot as u64) << 6) | (3 << 3) | 0x6;
+                    e.entry_lo[1] = ((slot as u64 + 1) << 6) | (3 << 3) | 0x6;
+                    src.write(slot, e);
+                }
+                let v1 = src.save_state();
 
-        let mut dst = MipsTlb::new(TLB_NUM_ENTRIES);
-        dst.load_state(&v1).expect("load_state");
-        let v2 = dst.save_state();
+                let mut dst = MipsTlb::new(TLB_NUM_ENTRIES);
+                dst.load_state(&v1).expect("load_state");
+                let v2 = dst.save_state();
 
-        assert_eq!(v1, v2, "MipsTlb save_state mismatch after load_state round-trip");
+                assert_eq!(v1, v2, "MipsTlb save_state mismatch after load_state round-trip");
+            })
+            .expect("spawn")
+            .join()
+            .expect("thread panicked");
     }
 }

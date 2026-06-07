@@ -63,8 +63,9 @@ pub const EXC_VCED: u32 = 31;     // Virtual Coherency Exception (Data)
 pub const CONFIG_CM: u32 = 31;    // Master checker mode
 pub const CONFIG_EC: u32 = 28;    // 3 bits, clock ratio  0 - 2, 1 - 3...
 pub const CONFIG_EP: u32 = 24;    // 4 bits transmit data pattern for writeback
-pub const CONFIG_SB: u32 = 22;    // 2 bits secondary cache size, 0 - 4 words, 1 - 8 ...
-pub const CONFIG_SS: u32 = 21;    // split secondary cache mode
+pub const CONFIG_SB: u32 = 22;    // 2 bits secondary cache block size: 1=8 words (32B) on R5K
+pub const CONFIG_SS: u32 = 21;    // R4K: 1 bit split secondary cache mode
+pub const CONFIG_TR_SS: u32 = 20; // Triton: 2 bits secondary cache size [21:20]: 00=512KB 01=1MB 10=2MB 11=none
 pub const CONFIG_SW: u32 = 20;    // secondary cache port width 0 - 128bit, 1 - 64bit
 pub const CONFIG_EW: u32 = 18;    // 2 bits system port width 0 - 64 bit, 1 - 32 bit
 pub const CONFIG_SC: u32 = 17;    // secondary cache present 0 - present, 1 - absent
@@ -72,6 +73,7 @@ pub const CONFIG_SM: u32 = 16;    // dirty shared coherency state 0 - enabled, 1
 pub const CONFIG_BE: u32 = 15;    // 1 - big endian, 0 - little endian
 pub const CONFIG_EM: u32 = 14;    // 1 - ecc enabled, 0 - parity enabled
 pub const CONFIG_EB: u32 = 13;    // 1 block ordering 1 - sequential 0 - sub block
+pub const CONFIG_SE: u32 = 12;    // R5K/Triton: secondary cache enable (R/W); 1=enabled
 pub const CONFIG_IC: u32 = 9;     // 3 bits ICache size 2^12+IC
 pub const CONFIG_DC: u32 = 6;     // 3 bits DCache size 2^12+IC
 pub const CONFIG_IB: u32 = 5;     // icache block size 0=16B 1=32B (R4000/R4400=0, R5000=1)
@@ -188,15 +190,17 @@ impl UndoBuffer {
     }
 
     fn push(&mut self, snapshot: CpuSnapshot) {
-        if !self.enabled {
-            return;
-        }
+        self.push_get_idx(snapshot);
+    }
 
-        self.snapshots[self.head] = Some(snapshot);
+    fn push_get_idx(&mut self, snapshot: CpuSnapshot) -> usize {
+        let idx = self.head;
+        self.snapshots[idx] = Some(snapshot);
         self.head = (self.head + 1) % UNDO_BUFFER_SIZE;
         if self.count < UNDO_BUFFER_SIZE {
             self.count += 1;
         }
+        idx
     }
 
     fn can_undo(&self, steps: usize) -> bool {
@@ -215,6 +219,13 @@ impl UndoBuffer {
         };
 
         self.snapshots[index].as_ref()
+    }
+
+    fn pop(&mut self) {
+        if self.count == 0 { return; }
+        self.head = if self.head == 0 { UNDO_BUFFER_SIZE - 1 } else { self.head - 1 };
+        self.snapshots[self.head] = None;
+        self.count -= 1;
     }
 
     fn clear(&mut self) {
@@ -270,13 +281,69 @@ impl TracebackBuffer {
     fn get_last(&self, n: usize) -> Vec<TracebackEntry> {
         let mut result = Vec::new();
         let count = n.min(self.count);
-        
+
         for i in 0..count {
             let idx = (self.head + TRACEBACK_SIZE - 1 - i) % TRACEBACK_SIZE;
             result.push(self.entries[idx]);
         }
         result.reverse();
         result
+    }
+}
+
+#[cfg(feature = "idle-pause")]
+/// Per-PC sampling counters: total times this PC was the about-to-execute PC,
+/// and how many of those had CPU interrupts enabled (IE=1, EXL=ERL=0).
+#[derive(Clone, Copy, Default)]
+struct IdleSample {
+    count: u64,
+    ie_count: u64,
+}
+
+/// Lightweight PC-sampling histogram used to locate hot spin loops — primarily
+/// the IRIX kernel idle loop, which is a tight backward branch that runs with
+/// interrupts enabled and only exits via an interrupt. Disabled by default;
+/// when `on` is false `step()` pays a single predictable-not-taken branch.
+///
+/// Workflow (the executor lock is held for the whole run, so toggling and
+/// reporting require the CPU to be stopped first):
+///   cpu stop; idleprof on; cont    # let the guest sit at an idle prompt
+///   cpu stop; idleprof report      # dump the hottest PCs + IE%
+///
+#[cfg(feature = "idle-pause")]
+/// The idle loop shows up as a small cluster of contiguous PCs that together
+/// dominate the samples with ie% == 100.
+#[derive(Default)]
+struct IdleProfiler {
+    /// Sample one in every `stride` executed instructions. 0/1 = every instr.
+    /// Subsampling bounds hot-path cost; the idle loop still dominates because
+    /// it is by far the most frequently executed code while the system idles.
+    stride: u64,
+    counter: u64,
+    total: u64,
+    hist: std::collections::HashMap<u64, IdleSample>,
+}
+
+#[cfg(feature = "idle-pause")]
+impl IdleProfiler {
+    #[inline(always)]
+    fn sample(&mut self, pc: u64, ie: bool) {
+        self.counter = self.counter.wrapping_add(1);
+        if self.stride > 1 && self.counter % self.stride != 0 {
+            return;
+        }
+        self.total += 1;
+        let e = self.hist.entry(pc).or_default();
+        e.count += 1;
+        if ie {
+            e.ie_count += 1;
+        }
+    }
+
+    fn reset(&mut self) {
+        self.counter = 0;
+        self.total = 0;
+        self.hist.clear();
     }
 }
 
@@ -332,7 +399,7 @@ pub struct DecodedInstr {
     /// Getters immi64()/imms64() widen to u64/i64 on the fly.
     pub imm:     u32,
     pub raw:     u32,
-    pub decoded: bool,              // true when all fields below are valid for this raw
+    pub decoded: bool,
     pub op:      u8,                // bits [31:26]
     pub rs:      u8,                // bits [25:21]  (also: base for loads/stores, fs for FPU)
     pub rt:      u8,                // bits [20:16]  (also: ft for FPU)
@@ -536,6 +603,14 @@ pub struct MipsExecutor<T: Tlb, C: MipsCache> {
     #[cfg(feature = "developer")]
     pending_memory_writes: Vec<MemoryWrite>,
     traceback: TracebackBuffer,
+    #[cfg(feature = "idle-pause")]
+    idle_profiler: IdleProfiler,
+    #[cfg(feature = "idle-pause")]
+    pub idle_profile_on: Arc<AtomicBool>,
+    #[cfg(feature = "idle-pause")]
+    pub idle_profile_reset: Arc<AtomicBool>,
+    #[cfg(feature = "idle-pause")]
+    idle_profile_on_ptr: *const AtomicBool,
     pub symbols: Arc<Mutex<SymbolTable>>,
     pub breakpoints: Vec<Breakpoint>,
     pub next_bp_id: usize,
@@ -644,7 +719,20 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         config |= 1 << CONFIG_BE;
 
         // SC (bit 17): Secondary cache present. 0=present, 1=absent.
-        config |= (if L2_SIZE > 0 { 0 } else { 1 }) << CONFIG_SC;
+        // SC=0: PROM detects L2 via CACH_SD|C_ILT probe → rmi_cacheflush (inclusive L2 path).
+        // SC=1: size_2nd_cache() returns 0 → PROM reads L2 size from EEPROM, sets
+        //       _two_set_pcaches=icache/2 → __cache_wb_inval does index IWBINV on both
+        //       L1D ways + index IINV on both L1I ways (correct for R5K non-inclusive L2).
+        // r5ksc_triton: SC=0 — Triton reports integrated L2 (PROM detects it via probe).
+        // r5k without r5ksc: SC=1 — no L2 present; PROM uses 2-way index flush.
+        // r5k + r5ksc (external): SC=1 — external cache sized via EEPROM; 2-way flush.
+        // R4K: SC=0 when L2 present, SC=1 when absent.
+        #[cfg(feature = "r5ksc_triton")]
+        { config |= 0 << CONFIG_SC; } // Triton: SC=0, integrated L2 present
+        #[cfg(all(feature = "r5k", not(feature = "r5ksc_triton")))]
+        { config |= 1 << CONFIG_SC; } // R5K non-Triton: SC=1, PROM uses 2-way index flush
+        #[cfg(not(feature = "r5k"))]
+        { config |= (if L2_SIZE > 0 { 0 } else { 1 }) << CONFIG_SC; }
 
         // SB (bits 23:22): Secondary cache block size.
         // 00=4 words (16B), 01=8 words (32B), 10=16 words (64B), 11=32 words (128B).
@@ -655,31 +743,27 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             128 => 0b11,
             _   => 0b11,
         }) << CONFIG_SB;
-/*
-For R4000SC/MC CPUs:
 
-  The size is determined algorithmically by the size_2nd_cache function.
-   1. Presence Check: It first reads CP0_CONFIG and checks the CONFIG_SC bit (bit 17). If this bit is 0, an L2 cache is present, and the test proceeds.
-   2. Sizing Algorithm:
-       * It writes data to memory addresses that are powers of two (128KB, 256KB, 512KB, etc.) to fill the cache.
-       * It then invalidates the cache tag at index 0, creating a unique "marker."
-       * It begins checking addresses again, starting from the smallest possible cache size, and uses a cache instruction to read the tag at each power-of-two boundary.
-       * When it reads a tag and finds the "marker" it wrote, it knows the cache has just "wrapped around." The address at which this wrap-around occurred indicates the total size of the
-         cache.
-   3. Set Variable: The final calculated size is then stored in the _sidcache_size global variable.
+        // Triton CONFIG_TR_SS (bits 21:20): secondary cache size.
+        // IP22 PROM probes L2 dynamically and ignores these bits.
+        // IP32 (O2) reads CONFIG[21:20] directly — must match for correct L2 detection.
+        #[cfg(feature = "r5ksc_triton")]
+        {
+            let ss: u32 = match L2_SIZE {
+                524288  => 0b00,  // 512 KB
+                1048576 => 0b01,  // 1 MB
+                2097152 => 0b10,  // 2 MB
+                _       => 0b11,  // none / 4 MB
+            };
+            config |= ss << CONFIG_TR_SS;
+        }
 
-*/
-/*
- L2 size on R5K
-
- The size is read directly from a bitfield in CP0_CONFIG.
-   1. The code reads CP0_CONFIG and masks for the CONFIG_TR_SS bits (bits 21-20).
-   2. The 2-bit value (00, 01, 10, or 11) is extracted.
-   3. This value is used as a multiplier for a base size (512KB) to calculate the total L2 cache size (512KB, 1MB, 2MB, or 4MB).
-
-*/        
         core.cp0_config = config;
         core.tlb_entries = cfg.tlb_entries as u32;
+
+        // Triton: sync initial L2 enabled state from Config SE bit (starts 0 = disabled).
+        #[cfg(feature = "r5ksc_triton")]
+        cache.set_l2_enabled((config >> CONFIG_SE) & 1 != 0);
 
         /*eprintln!("Cache config: L1I {}KB/{}B-line  L1D {}KB/{}B-line  L2 {}KB/{}B-line  CP0.Config={:#010x}",
             ic_size / 1024, ic_line,
@@ -700,6 +784,14 @@ For R4000SC/MC CPUs:
             #[cfg(feature = "developer")]
             pending_memory_writes: Vec::new(),
             traceback: TracebackBuffer::new(),
+            #[cfg(feature = "idle-pause")]
+            idle_profiler: IdleProfiler::default(),
+            #[cfg(feature = "idle-pause")]
+            idle_profile_on: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "idle-pause")]
+            idle_profile_reset: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "idle-pause")]
+            idle_profile_on_ptr: std::ptr::null(),
             symbols: Arc::new(Mutex::new(SymbolTable::new())),
             breakpoints: vec![Breakpoint {
                 id: 0, addr: 0, kind: BpType::Pc, enabled: false, condition: None
@@ -731,6 +823,7 @@ For R4000SC/MC CPUs:
         executor.rebind_atomic_ptrs();
         executor.update_translate_fn();
         executor.update_fpr_mode();
+
         executor
     }
 
@@ -740,6 +833,8 @@ For R4000SC/MC CPUs:
         self.cycles_ptr     = Arc::as_ptr(&self.core.cycles);
         self.interrupts_ptr = Arc::as_ptr(&self.core.interrupts);
         self.fasttick_ptr   = Arc::as_ptr(&self.core.fasttick_count);
+        #[cfg(feature = "idle-pause")]
+        { self.idle_profile_on_ptr = Arc::as_ptr(&self.idle_profile_on); }
     }
 
     /// Install the CP0 Status change callback pointing at this executor.
@@ -758,9 +853,16 @@ For R4000SC/MC CPUs:
         let va_page = va & !0xFFF;
         let slot = &self.core.nanotlb[AT as usize];
         if slot.matches(va_page) {
+            #[cfg(feature = "tlbstats")]
+            {
+                let at = unsafe { std::mem::transmute::<u8, AccessType>(AT) };
+                self.tlb.stats_nanotlb_hit(at);
+            }
             return TranslateResult::ok(slot.phys_addr(va), slot.cache_attr_raw());
         }
         let at = unsafe { std::mem::transmute::<u8, AccessType>(AT) };
+        #[cfg(feature = "tlbstats")]
+        self.tlb.stats_nanotlb_miss(at);
         let result = (self.translate_fn)(self, va, at);
         if !result.is_exception() {
             self.core.nanotlb[AT as usize].fill_raw(va_page, result.phys as u64, result.status & 0x7);
@@ -871,6 +973,20 @@ For R4000SC/MC CPUs:
         let pending = unsafe { &*self.interrupts_ptr }.load(Ordering::Relaxed);
 
         let pc = self.core.pc;
+
+        // Spin/idle-loop PC sampler. Armed lock-free via the shared atomic, so
+        // the CPU is never paused/resumed to enable it (resuming corrupts a
+        // live kernel). Inert (one relaxed load + branch) when disarmed.
+        #[cfg(feature = "idle-pause")]
+        if unsafe { &*self.idle_profile_on_ptr }.load(Ordering::Relaxed) {
+            if self.idle_profile_reset.load(Ordering::Relaxed) {
+                self.idle_profiler.reset();
+                self.idle_profile_reset.store(false, Ordering::Relaxed);
+            }
+            let ie = self.core.interrupts_enabled();
+            self.idle_profiler.sample(pc, ie);
+        }
+
         #[cfg(not(feature = "lightning"))]
         if self.bp_enabled() && self.check_breakpoint::<{ BpType::Pc as u8 }>(pc) {
             return EXEC_BREAKPOINT;
@@ -911,15 +1027,17 @@ For R4000SC/MC CPUs:
 
         let fetch = self.fetch_instr(pc);
         let result = if fetch.status == EXEC_COMPLETE {
-            let slot = fetch.instr as *mut DecodedInstr;
-            let d = unsafe { &mut *slot };
-            if !d.decoded {
-                decode_into::<T, C>(d);
-            } else {
-                #[cfg(feature = "developer")]
-                self.decoded_count.fetch_add(1, Ordering::Relaxed);
+            {
+                let slot = fetch.instr as *mut DecodedInstr;
+                let d = unsafe { &mut *slot };
+                if !d.decoded {
+                    decode_into::<T, C>(d);
+                } else {
+                    #[cfg(feature = "developer")]
+                    self.decoded_count.fetch_add(1, Ordering::Relaxed);
+                }
             }
-            let d = unsafe { &*slot };
+            let d = unsafe { &*fetch.instr };
             #[cfg(not(feature = "lightning"))]
             self.traceback.push(pc, d.raw);
             self.exec_decoded(d)
@@ -971,12 +1089,12 @@ For R4000SC/MC CPUs:
                 fetch.status
             };
         }
-        let slot = fetch.instr as *mut DecodedInstr;
-        let d = unsafe { &mut *slot };
-        if !d.decoded {
-            decode_into::<T, C>(d);
+        {
+            let slot = fetch.instr as *mut DecodedInstr;
+            let d = unsafe { &mut *slot };
+            if !d.decoded { decode_into::<T, C>(d); }
         }
-        self.exec_decoded(unsafe { &*slot })
+        self.exec_decoded(unsafe { &*fetch.instr })
     }
 
     #[inline(always)]
@@ -991,8 +1109,12 @@ For R4000SC/MC CPUs:
         let mut hit = false;
         for bp in &self.breakpoints {
             if bp.enabled && bp.kind as u8 == KIND {
-                // Ignore bottom 2 bits for address comparison
-                if (bp.addr & !3) == (addr & !3) {
+                // Normalize to physical: strip sign-extension and kseg bits (top 3 of
+                // low 32), then mask bottom 2 for word alignment.  This makes a bp set
+                // on physical 0x1fbb0010 hit whether the CPU access came through kseg0
+                // (0x9fbb0010) or kseg1 (0xbfbb0010).
+                const PHYS_MASK: u64 = 0x1FFF_FFF8;
+                if (bp.addr & PHYS_MASK) == (addr & PHYS_MASK) {
                     // Check optional register condition
                     if let Some(expr) = &bp.condition {
                         let symbols = self.symbols.lock();
@@ -1001,6 +1123,10 @@ For R4000SC/MC CPUs:
                             // If evaluation fails, we assume the condition is not met (or maybe we should break to show error?)
                             Err(_) => continue, 
                         }
+                    }
+                    if KIND != BpType::Pc as u8 {
+                        eprintln!("[bp] mem bp {} hit: kind={:?} bp_addr={:#010x} access_addr={:#010x} pc={:#018x}",
+                            bp.id, bp.kind, bp.addr, addr, self.core.pc);
                     }
                     self.last_bp_hit = Some(bp.id);
                     hit = true;
@@ -3076,6 +3202,7 @@ For R4000SC/MC CPUs:
         let rd_val = d.rd as u32;
         // Sign-extend from 32 bits
         self.core.write_cp0(rd_val, rt_val as u32 as i32 as i64 as u64);
+        self.handle_cp0_side_effects(rd_val);
         EXEC_COMPLETE
     }
 
@@ -3084,7 +3211,17 @@ For R4000SC/MC CPUs:
         let rt_val = self.core.read_gpr(d.rt as u32);
         let rd_val = d.rd as u32;
         self.core.write_cp0(rd_val, rt_val);
+        self.handle_cp0_side_effects(rd_val);
         EXEC_COMPLETE
+    }
+
+    fn handle_cp0_side_effects(&mut self, reg: u32) {
+        #[cfg(feature = "r5ksc_triton")]
+        if reg == 16 {
+            // CONFIG_SE (bit 12): wire L2 enable/disable to cache.
+            let se = (self.core.cp0_config >> CONFIG_SE) & 1 != 0;
+            self.cache.set_l2_enabled(se);
+        }
     }
 
     // TLB Instructions
@@ -3115,8 +3252,8 @@ For R4000SC/MC CPUs:
 
         // Write to CP0 registers, clearing G bit from EntryHi
         self.core.cp0_entryhi = entry.entry_hi & !0x1000; // Clear bit 12 (G bit)
-        self.core.cp0_entrylo0 = (entry.entry_lo0 & !1) | g_bit; // Set G bit from EntryHi
-        self.core.cp0_entrylo1 = (entry.entry_lo1 & !1) | g_bit; // Set G bit from EntryHi
+        self.core.cp0_entrylo0 = (entry.entry_lo[0] & !1) | g_bit; // Set G bit from EntryHi
+        self.core.cp0_entrylo1 = (entry.entry_lo[1] & !1) | g_bit; // Set G bit from EntryHi
         self.core.cp0_pagemask = entry.page_mask;
 
         if mips_log(MIPS_LOG_TLB) { dlog_dev!(LogModule::Mips, "TLBR: Read Index {}\n{}", index, self.tlb.format_entry(index)); }
@@ -3140,8 +3277,10 @@ For R4000SC/MC CPUs:
         TlbEntry {
             page_mask: self.core.cp0_pagemask,
             entry_hi: (self.core.cp0_entryhi & EH_WM & !0x1000) | g_combined,
-            entry_lo0: self.core.cp0_entrylo0,
-            entry_lo1: self.core.cp0_entrylo1,
+            entry_lo: [self.core.cp0_entrylo0, self.core.cp0_entrylo1],
+            selector_bit_shift: 0, // all derived fields overwritten by MipsTlb::write()
+            vcmp32: 0, vpn_hi32: 0, vcmp64: 0, vpn_hi64: 0,
+            offset_mask: 0, pfn_base: [0; 2],
         }
     }
 
@@ -3150,7 +3289,7 @@ For R4000SC/MC CPUs:
     fn exec_tlbwi(&mut self) -> ExecStatus {
         let index = (self.core.cp0_index as usize) % self.tlb.num_entries();
         let entry = self.create_tlb_entry_from_cp0();
-        //eprintln!("TLBWI idx={} entryhi={:#018x} lo0={:#018x} lo1={:#018x} pc={:#018x}", index, entry.entry_hi, entry.entry_lo0, entry.entry_lo1, self.core.pc);
+        //eprintln!("TLBWI idx={} entryhi={:#018x} lo0={:#018x} lo1={:#018x} pc={:#018x}", index, entry.entry_hi, entry.entry_lo[0], entry.entry_lo[1], self.core.pc);
         self.tlb.write(index, entry);
         self.core.nanotlb_invalidate();
 
@@ -4621,6 +4760,11 @@ pub struct MipsCpu<T: Tlb, C: MipsCache> {
     pub fasttick_count: Arc<AtomicU64>,
     debug: Arc<AtomicBool>,
     exception_mask: Arc<AtomicU32>,
+    trace_file: Arc<Mutex<Option<std::io::BufWriter<std::fs::File>>>>,
+    #[cfg(feature = "idle-pause")]
+    idle_profile_on: Arc<AtomicBool>,
+    #[cfg(feature = "idle-pause")]
+    idle_profile_reset: Arc<AtomicBool>,
 }
 
 impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
@@ -4628,6 +4772,10 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
         let cycles = executor.core.cycles.clone();
         let interrupts = executor.core.interrupts.clone();
         let fasttick_count = executor.core.fasttick_count.clone();
+        #[cfg(feature = "idle-pause")]
+        let idle_profile_on = executor.idle_profile_on.clone();
+        #[cfg(feature = "idle-pause")]
+        let idle_profile_reset = executor.idle_profile_reset.clone();
 
         let executor_arc = Arc::new(Mutex::new(executor));
         executor_arc.lock().install_status_cb();
@@ -4641,9 +4789,28 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
             fasttick_count,
             debug: Arc::new(AtomicBool::new(false)),
             exception_mask: Arc::new(AtomicU32::new(0)),
+            trace_file: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "idle-pause")]
+            idle_profile_on,
+            #[cfg(feature = "idle-pause")]
+            idle_profile_reset,
         }
     }
 
+    /// Arm the idle-loop PC sampler without taking the executor lock (so the
+    /// running CPU is never paused/resumed). Requests a histogram reset which
+    /// the CPU thread performs on its next step.
+    #[cfg(feature = "idle-pause")]
+    pub fn idle_profile_arm(&self) {
+        self.idle_profile_reset.store(true, Ordering::SeqCst);
+        self.idle_profile_on.store(true, Ordering::SeqCst);
+    }
+
+    /// Disarm the sampler (lock-free).
+    #[cfg(feature = "idle-pause")]
+    pub fn idle_profile_disarm(&self) {
+        self.idle_profile_on.store(false, Ordering::SeqCst);
+    }
 
     pub fn run_debug_loop(&self, mut count: Option<usize>, wait: bool, mut writer: Box<dyn Write + Send>) {
         self.stop(); // Ensure stopped before running
@@ -4654,6 +4821,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
         let running = self.running.clone();
         let debug = self.debug.clone();
         let exception_mask = self.exception_mask.clone();
+        let trace_file = self.trace_file.clone();
 
         let task = move || {
             let mut exec = executor.lock();
@@ -4676,13 +4844,18 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
                     count = Some(c - 1);
                 }
 
-                // Capture snapshot before executing instruction (for undo)
+                // Capture snapshot BEFORE executing — this is the state to restore on undo.
+                // memory_writes are collected during step() into pending_memory_writes, then
+                // patched into the snapshot afterwards so a single undo entry is self-contained.
                 #[cfg(feature = "developer")]
-                if exec.undo_buffer.is_enabled() {
-                    let mut snapshot = exec.create_snapshot();
-                    snapshot.memory_writes = Vec::new();
-                    exec.undo_buffer.push(snapshot);
-                }
+                let undo_snap_idx = if exec.undo_buffer.is_enabled() {
+                    exec.pending_memory_writes.clear();
+                    let snapshot = exec.create_snapshot();
+                    let idx = exec.undo_buffer.push_get_idx(snapshot);
+                    Some(idx)
+                } else {
+                    None
+                };
 
                 // Try step with breakpoints enabled.
                 // step() now pushes (pc, instr) into traceback on successful fetch.
@@ -4704,15 +4877,18 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
                     first_step = false;
                 }
 
-                // Commit memory writes to the last snapshot after successful execution
+                // Patch the memory writes collected during step() into the pre-step snapshot.
                 #[cfg(feature = "developer")]
-                if exec.undo_buffer.is_enabled() {
-                    exec.commit_undo_snapshot();
+                if let Some(idx) = undo_snap_idx {
+                    let writes = std::mem::take(&mut exec.pending_memory_writes);
+                    if let Some(ref mut snap) = exec.undo_buffer.snapshots[idx] {
+                        snap.memory_writes = writes;
+                    }
                 }
 
                 // Display executed instruction from traceback (already captured by step())
                 let insn_trace = debug.load(Ordering::Relaxed) || mips_log(MIPS_LOG_INSN);
-                if insn_trace || count.is_some() {
+                if insn_trace || count.is_some() || trace_file.lock().is_some() {
                     if let Some(entry) = exec.traceback.get_last(1).into_iter().next() {
                         let symbols = exec.symbols.lock();
                         let sym_str = format_pc_symbol(entry.pc, &symbols);
@@ -4723,7 +4899,12 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
                             writeln!(writer, "{}", info).unwrap();
                         }
                         if count.is_some() {
-                            writeln!(writer, "Exec: {}", info).unwrap();
+                            // Route through devlog writers so Exec: lines serialize with
+                            // cache/device dlog output on the same TCP socket.
+                            crate::dlog_unconditional!("Exec: {}", info);
+                        }
+                        if let Some(ref mut f) = *trace_file.lock() {
+                            let _ = writeln!(f, "{}", info);
                         }
                     } else if insn_trace {
                         writeln!(writer, "PC: {:016x} (Fetch failed)", exec.core.pc).unwrap();
@@ -4780,6 +4961,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
                 }
             }
             exec.flush_cycles();
+            if let Some(ref mut f) = *trace_file.lock() { let _ = f.flush(); }
 
             // Print next instruction
             let next_pc = exec.core.pc;
@@ -4817,7 +4999,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
         register_lock_fn("cpu::executor", move || ex.is_locked());
     }
 
-    fn try_lock_executor(&self) -> Result<parking_lot::MutexGuard<MipsExecutor<T, C>>, String> {
+    fn try_lock_executor(&self) -> Result<parking_lot::MutexGuard<'_, MipsExecutor<T, C>>, String> {
         self.executor.try_lock().ok_or_else(|| "CPU thread holds the executor lock; try 'cpu stop' first".to_string())
     }
 
@@ -4952,6 +5134,8 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
         if let Some(handle) = self.thread.lock().take() {
             let _ = handle.join();
         }
+        #[cfg(feature = "tlbstats")]
+        self.executor.lock().tlb.stats_print();
         #[cfg(feature = "developer_ip7")]
         {
             let map = &self.executor.lock().core.compare_delta_stats;
@@ -4989,6 +5173,34 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
             //let mut last_cycles: u64 = guard.core.cycles.load(Ordering::Relaxed);
             //let mut last_time = std::time::Instant::now();
             // --- end perf sampling ---
+
+            // Idle detection + park state (see docs/idle-pause-work.md). Compiled
+            // in only with the `idle-pause` feature (off by default; opt in with
+            // --features idle-pause). When compiled in, set IRIS_NO_IDLE to keep
+            // spinning the host CPU at runtime (for benchmarking/debug).
+            //
+            // We only park when the architectural state (PC + all GPRs) REPEATS
+            // across batches. A polling/idle loop (e.g. the kernel idle loop
+            // waiting on the run queue) cycles through the same states and exits
+            // only on an interrupt — safe to park. A busy-delay loop (e.g. IRIX
+            // DELAY(): `bgezl v1,-1; subu v1,v1,v0`) changes a counter every
+            // iteration, so its state never repeats — we must NOT park it or
+            // boot stalls. The state-repeat test distinguishes the two.
+            #[cfg(feature = "idle-pause")]
+            let idle_enabled = std::env::var_os("IRIS_NO_IDLE").is_none();
+            // Ring of recent architectural-state hashes (PC folded with all GPRs),
+            // one per idle-suspected batch. A polling/idle loop cycles through a
+            // small set of states, so a hash repeats within ~the loop period; a
+            // delay loop's counter makes every state unique, so it never repeats.
+            #[cfg(feature = "idle-pause")]
+            const IDLE_RING: usize = 32;
+            #[cfg(feature = "idle-pause")]
+            let mut idle_ring = [0u64; IDLE_RING];
+            #[cfg(feature = "idle-pause")]
+            let mut idle_ring_len = 0usize;
+            #[cfg(feature = "idle-pause")]
+            let mut idle_ring_pos = 0usize;
+
             #[allow(unreachable_code)]
             while running.load(Ordering::Relaxed) {
                 #[cfg(feature = "lightning")]
@@ -5016,6 +5228,110 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                 }
                 // Flush local cycle counter to shared atomic once per batch
                 guard.flush_cycles();
+
+                // --- idle detection + in-place park (stop spinning host CPU) ---
+                // The kernel idle loop is a tight loop with interrupts enabled and
+                // nothing pending; it exits only on an interrupt. When we detect it,
+                // park the CPU thread until the next CP0 Compare tick or a device
+                // interrupt, advancing cp0_count + local_cycles by the REAL elapsed
+                // time so the wallclock timer and its Compare-write calibration stay
+                // consistent (advancing only count would spike count_step — see
+                // docs/idle-pause-work.md §4). We never stop/restart the thread or
+                // peripherals; we just sleep in place, so the kernel is undisturbed.
+                #[cfg(feature = "idle-pause")]
+                if idle_enabled {
+                    let ie = guard.core.interrupts_enabled();
+                    let pending = guard.core.interrupts.load(Ordering::Relaxed) as u32;
+                    let ip = (guard.core.cp0_cause | pending) & crate::mips_core::CAUSE_IP_MASK;
+                    let im = guard.core.cp0_status & crate::mips_core::STATUS_IM_MASK;
+                    let interrupt_ready = (ip & im) != 0; // would be delivered next step
+
+                    // `state_repeated` is true only if the current PC+GPR hash
+                    // matches one seen recently — i.e. the loop revisited a state
+                    // (polling), as opposed to a delay loop whose counter makes
+                    // every state unique.
+                    let mut state_repeated = false;
+                    if ie && !interrupt_ready {
+                        // Hash PC + GPRs, but SKIP k0/k1 ($26/$27): those are the
+                        // kernel's exception-handler scratch registers and hold
+                        // leftover junk that differs whenever a timer tick fired
+                        // between iterations — they are not part of the loop's
+                        // real state. (Confirmed: across idle-loop iterations only
+                        // k0/k1 change; a delay loop changes a real reg like v1.)
+                        let mut h = guard.core.pc;
+                        for (i, &g) in guard.core.gpr.iter().enumerate() {
+                            if i == 26 || i == 27 { continue; }
+                            h = h.rotate_left(7) ^ g;
+                        }
+                        if idle_ring[..idle_ring_len].contains(&h) {
+                            // State repeated → still idle. Keep the ring so that
+                            // after a timer tick wakes us the very next batch hash
+                            // matches again and we re-park immediately (otherwise
+                            // we'd re-accumulate the ring every tick, ~5% wasted).
+                            state_repeated = true;
+                        } else {
+                            idle_ring[idle_ring_pos] = h;
+                            idle_ring_pos = (idle_ring_pos + 1) % IDLE_RING;
+                            if idle_ring_len < IDLE_RING {
+                                idle_ring_len += 1;
+                            }
+                        }
+                    } else {
+                        idle_ring_len = 0;
+                        idle_ring_pos = 0;
+                    }
+
+                    if state_repeated {
+                        // counts/10ms tick: the CP0 Count hardware rate (independent of
+                        // whether the current tick is the 100 Hz or 1 kHz interval).
+                        let slow_hw = guard.core.compare_delta_slow >> 32;
+                        let cs = guard.core.count_step; // 32.32 counts/instruction
+                        if slow_hw != 0 && cs != 0 {
+                            const SLICE_NS: u64 = 1_000_000;  // 1 ms slices → ≤1 ms IRQ latency
+                            const MIN_SLICE_NS: u64 = 50_000; // <50 µs to tick: just fire it
+                            loop {
+                                if !running.load(Ordering::Relaxed) { break; }
+                                let cnt = guard.core.cp0_count;
+                                let cmp = guard.core.cp0_compare;
+                                let diff = cmp.wrapping_sub(cnt);
+                                // high bit set => count already past compare => tick due now
+                                if (diff >> 63) != 0 || (diff >> 32) == 0 {
+                                    guard.core.cp0_count = cmp;
+                                    guard.core.cp0_cause |= crate::mips_core::CAUSE_IP7;
+                                    break;
+                                }
+                                // a device interrupt became ready while we were idle
+                                let pending = guard.core.interrupts.load(Ordering::Relaxed) as u32;
+                                let ip = (guard.core.cp0_cause | pending) & crate::mips_core::CAUSE_IP_MASK;
+                                let im = guard.core.cp0_status & crate::mips_core::STATUS_IM_MASK;
+                                if (ip & im) != 0 { break; }
+
+                                let rem_hw = diff >> 32;
+                                let ns_to_tick = (rem_hw as u128 * 10_000_000u128 / slow_hw as u128) as u64;
+                                let slice_ns = ns_to_tick.min(SLICE_NS);
+                                if slice_ns < MIN_SLICE_NS {
+                                    guard.core.cp0_count = cmp;
+                                    guard.core.cp0_cause |= crate::mips_core::CAUSE_IP7;
+                                    break;
+                                }
+                                // Drop the executor lock so the monitor stays responsive
+                                // while we sleep; re-acquire after.
+                                guard.flush_cycles();
+                                drop(guard);
+                                let t0 = std::time::Instant::now();
+                                std::thread::sleep(std::time::Duration::from_nanos(slice_ns));
+                                let elapsed_ns = t0.elapsed().as_nanos() as u64;
+                                guard = executor.lock();
+                                // Advance guest time by the real elapsed time.
+                                let adv_hw = (elapsed_ns as u128 * slow_hw as u128 / 10_000_000u128) as u64;
+                                guard.core.cp0_count = guard.core.cp0_count.wrapping_add(adv_hw << 32);
+                                let adv_instrs = (((adv_hw as u128) << 32) / cs as u128) as u64;
+                                guard.core.local_cycles = guard.core.local_cycles.wrapping_add(adv_instrs);
+                            }
+                        }
+                    }
+                }
+                // --- end idle park ---
                 // --- perf sampling (comment out to disable) ---
                 //let cycles = guard.core.cycles.load(Ordering::Relaxed);
                 //if cycles.wrapping_sub(last_cycles) >= 100_000_000 {
@@ -5095,13 +5411,15 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
             ("setreg".to_string(), "Set register value: setreg <reg> <value>".to_string()),
             ("translate".to_string(), "Translate virtual address: translate <addr>".to_string()),
             ("t".to_string(), "Alias for translate".to_string()),
-            ("debug".to_string(), "Enable/disable CPU tracing: debug <on|off> [DEV]".to_string()),
+            ("debug".to_string(), "CPU instruction trace: debug <on|off|file <path>> [DEV]".to_string()),
             ("ex".to_string(), "Alias for exception".to_string()),
             ("undo".to_string(), "Undo N instructions or control undo buffer: undo [count] | undo <on|off|clear> [DEV]".to_string()),
             ("dt".to_string(), "Disassemble traceback: dt [count]".to_string()),
+            ("idleprof".to_string(), "Locate idle/spin loops via PC sampling: idleprof <on|off|report [count]>".to_string()),
             ("u".to_string(), "Alias for undo [DEV]".to_string()),
             ("sym".to_string(), "Lookup symbol: sym <addr>".to_string()),
             ("loadsym".to_string(), "Load symbols from file: loadsym <file>".to_string()),
+            ("proc".to_string(), "IRIX kernel introspection: proc info  (requires `loadsym` first)".to_string()),
             ("l1i".to_string(), "L1 Instruction Cache commands: l1i <check|dump> <addr|index>".to_string()),
             ("l1d".to_string(), "L1 Data Cache commands: l1d <check|dump> <addr|index>".to_string()),
             ("l2".to_string(), "L2 Cache commands: l2 <check|dump> <addr|index>".to_string()),
@@ -5268,6 +5586,75 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                 writeln!(writer, "{:016x} = ???", addr).unwrap();
             }
             return Ok(());
+        }
+
+        if actual_cmd == "proc" {
+            let mut exec = self.try_lock_executor()?;
+            // Helper closures around debug_read so the body stays readable.
+            // All reads here are big-endian (IRIX kernel).
+            let read_u32 = |exec: &mut MipsExecutor<T, C>, vaddr: u64| -> Result<u32, String> {
+                exec.debug_read(vaddr, 4)
+                    .map(|v| v as u32)
+                    .map_err(|e| format!("debug_read({:#x}): {:?}", vaddr, e))
+            };
+            let read_bytes = |exec: &mut MipsExecutor<T, C>, vaddr: u64, n: usize| -> Result<Vec<u8>, String> {
+                let mut out = Vec::with_capacity(n);
+                // debug_read returns up to 8 bytes per call; chunk it.
+                let mut a = vaddr;
+                let mut remaining = n;
+                while remaining > 0 {
+                    let step = remaining.min(4);
+                    let v = exec.debug_read(a, step)
+                        .map_err(|e| format!("debug_read({:#x}): {:?}", a, e))?;
+                    // big-endian: high byte first within `step` bytes
+                    for i in (0..step).rev() {
+                        out.push(((v >> (i * 8)) & 0xff) as u8);
+                    }
+                    a += step as u64;
+                    remaining -= step;
+                }
+                Ok(out)
+            };
+            // Probe `utsname` symbol and read sysname/release.
+            let utsname_va = {
+                let symbols = exec.symbols.lock();
+                match symbols.get_addr("utsname") {
+                    Some(a) => a,
+                    None => return Err("symbol 'utsname' not found — run `loadsym <unix.nm>` first".to_string()),
+                }
+            };
+            // IRIX utsname has 5 fields of SYS_NMLN bytes each. SYS_NMLN is
+            // 257 on IRIX 5.3 (large for POSIX), but we only read the front
+            // null-terminated strings. Read 256 bytes per field to be safe.
+            const NMLN: usize = 257;
+            let buf = read_bytes(&mut exec, utsname_va, NMLN * 5)?;
+            let read_str = |off: usize| -> String {
+                let end = buf[off..off + NMLN].iter().position(|&b| b == 0).unwrap_or(NMLN);
+                String::from_utf8_lossy(&buf[off..off + end]).into_owned()
+            };
+            let sysname  = read_str(0 * NMLN);
+            let nodename = read_str(1 * NMLN);
+            let release  = read_str(2 * NMLN);
+            let version  = read_str(3 * NMLN);
+            let machine  = read_str(4 * NMLN);
+
+            let sub = actual_args.first().copied().unwrap_or("info");
+            if sub == "info" {
+                writeln!(writer, "utsname @ {:#x}:", utsname_va).unwrap();
+                writeln!(writer, "  sysname  = {:?}", sysname).unwrap();
+                writeln!(writer, "  nodename = {:?}", nodename).unwrap();
+                writeln!(writer, "  release  = {:?}", release).unwrap();
+                writeln!(writer, "  version  = {:?}", version).unwrap();
+                writeln!(writer, "  machine  = {:?}", machine).unwrap();
+                let nproc_va = exec.symbols.lock().get_addr("nproc").ok_or_else(|| "symbol 'nproc' not found".to_string())?;
+                let proc_va  = exec.symbols.lock().get_addr("proc").ok_or_else(|| "symbol 'proc' not found".to_string())?;
+                let nproc = read_u32(&mut exec, nproc_va)?;
+                let proc_ptr = read_u32(&mut exec, proc_va)?;
+                writeln!(writer, "nproc    @ {:#x} = {}", nproc_va, nproc).unwrap();
+                writeln!(writer, "proc[]   @ {:#x} -> {:#x}", proc_va, proc_ptr).unwrap();
+                return Ok(());
+            }
+            return Err("Usage: proc info".to_string());
         }
 
         if actual_cmd == "ll" {
@@ -5698,15 +6085,33 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
             }
             "debug" => {
                 if actual_args.is_empty() {
-                    return Err("Usage: debug <on|off>".to_string());
+                    return Err("Usage: debug <on|off|file> [filename]".to_string());
                 }
-                let val = match actual_args[0] {
-                    "on" | "1" => true,
-                    "off" | "0" => false,
-                    _ => return Err("Usage: debug <on|off>".to_string()),
-                };
-                self.debug.store(val, Ordering::Relaxed);
-                writeln!(writer, "CPU debug {}", if val { "enabled" } else { "disabled" }).unwrap();
+                match actual_args[0] {
+                    "on" | "1" => {
+                        self.debug.store(true, Ordering::Relaxed);
+                        *self.trace_file.lock() = None;
+                        writeln!(writer, "CPU debug enabled (console output)").unwrap();
+                    }
+                    "off" | "0" => {
+                        self.debug.store(false, Ordering::Relaxed);
+                        *self.trace_file.lock() = None;
+                        writeln!(writer, "CPU debug disabled").unwrap();
+                    }
+                    "file" => {
+                        // file <path>: trace to file only, no socket spam
+                        let path = actual_args.get(1).ok_or("Usage: debug file <filename>")?;
+                        match std::fs::File::create(path) {
+                            Ok(f) => {
+                                self.debug.store(false, Ordering::Relaxed);
+                                *self.trace_file.lock() = Some(std::io::BufWriter::new(f));
+                                writeln!(writer, "CPU trace -> {}", path).unwrap();
+                            }
+                            Err(e) => return Err(format!("Cannot open {}: {}", path, e)),
+                        }
+                    }
+                    _ => return Err("Usage: debug <on|off|file> [filename]".to_string()),
+                }
                 Ok(())
             }
             "ex" | "exception" | "exc" => {
@@ -5826,6 +6231,11 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                         let _ = exec.debug_write(mem_write.virt_addr, mem_write.old_value, mem_write.size, 0);
                     }
 
+                    // Pop the consumed snapshots so subsequent undos go further back.
+                    for _ in 0..count {
+                        exec.undo_buffer.pop();
+                    }
+
                     writeln!(writer, "Undid {} instruction(s), PC now at {:016x}", count, exec.core.pc).unwrap();
                     Ok(())
                 } else {
@@ -5881,6 +6291,27 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                 }
                 Ok(())
             }
+            #[cfg(feature = "idle-pause")]
+            "idleprof" => {
+                let sub = actual_args.first().copied().unwrap_or("report");
+                match sub {
+                    "on" => {
+                        self.idle_profile_arm();
+                        writeln!(writer, "idleprof: armed (lock-free, histogram reset). Let the guest idle, then `stop; idleprof report`.").unwrap();
+                    }
+                    "off" => {
+                        self.idle_profile_disarm();
+                        writeln!(writer, "idleprof: disarmed.").unwrap();
+                    }
+                    "report" => {
+                        let count = actual_args.get(1).and_then(|s| s.parse().ok()).unwrap_or(32);
+                        let mut exec = self.try_lock_executor()?;
+                        exec.idle_profile_report(count, &mut writer);
+                    }
+                    _ => return Err("Usage: idleprof <on | off | report [count]>".to_string()),
+                }
+                Ok(())
+            }
             _ => Err(format!("Unknown CPU command: {}", actual_cmd)),
         }
     }
@@ -5888,6 +6319,95 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
 }
 
 impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
+    /// Dump the hottest sampled PCs and flag a likely idle-loop region: the
+    /// smallest contiguous PC window (<=256 bytes) of always-interrupts-enabled
+    /// samples that together account for the bulk of execution.
+    #[cfg(feature = "idle-pause")]
+    pub fn idle_profile_report(&mut self, top: usize, writer: &mut dyn Write) {
+        let total = self.idle_profiler.total;
+        if total == 0 {
+            let _ = writeln!(writer, "idleprof: no samples (run `idleprof on`, let the guest idle, then `cpu stop`)");
+            return;
+        }
+
+        let mut rows: Vec<(u64, IdleSample)> =
+            self.idle_profiler.hist.iter().map(|(&pc, &s)| (pc, s)).collect();
+        rows.sort_by(|a, b| b.1.count.cmp(&a.1.count));
+
+        // Pre-fetch instruction words for the displayed PCs while we still hold
+        // `&mut self`; disassembly below borrows `self.symbols`, which would
+        // otherwise conflict with debug_fetch_instr's `&mut self`.
+        let instrs: std::collections::HashMap<u64, Option<u32>> = rows
+            .iter()
+            .take(top)
+            .map(|(pc, _)| (*pc, self.debug_fetch_instr(*pc).ok()))
+            .collect();
+
+        let symbols = self.symbols.lock();
+        let _ = writeln!(
+            writer,
+            "idleprof: {} samples (stride {}), {} distinct PCs — top {}:",
+            total, self.idle_profiler.stride, rows.len(), top.min(rows.len())
+        );
+        let _ = writeln!(writer, "  {:>16}  {:>7}  {:>5}  {:>4}  symbol / disasm", "pc", "count", "pct", "ie%");
+        for (pc, s) in rows.iter().take(top) {
+            let pct = s.count as f64 * 100.0 / total as f64;
+            let iepct = s.ie_count as f64 * 100.0 / s.count as f64;
+            let sym = format_pc_symbol(*pc, &symbols);
+            let dis = match instrs.get(pc).copied().flatten() {
+                Some(instr) => mips_dis::disassemble(instr, *pc, Some(&symbols)),
+                None => "<fetch failed>".to_string(),
+            };
+            let _ = writeln!(
+                writer,
+                "  {:016x}  {:>7}  {:4.1}%  {:3.0}%  {}{}",
+                pc, s.count, pct, iepct, sym, format!("  {}", dis)
+            );
+        }
+
+        // Idle-loop heuristic: among the hottest PCs that are interrupt-enabled
+        // ~always, find the tightest contiguous window covering >=50% of samples.
+        let mut hot: Vec<(u64, IdleSample)> = rows
+            .iter()
+            .filter(|(_, s)| s.ie_count * 100 >= s.count * 99) // IE >= 99%
+            .cloned()
+            .collect();
+        hot.sort_by_key(|(pc, _)| *pc);
+        let mut best: Option<(u64, u64, u64)> = None; // (lo, hi, covered)
+        for i in 0..hot.len() {
+            let lo = hot[i].0;
+            let mut covered = 0u64;
+            let mut hi = lo;
+            for &(pc, s) in &hot[i..] {
+                if pc.wrapping_sub(lo) > 256 {
+                    break;
+                }
+                hi = pc;
+                covered += s.count;
+            }
+            if covered * 2 >= total && best.map_or(true, |(_, _, c)| covered > c) {
+                best = Some((lo, hi, covered));
+            }
+        }
+        match best {
+            Some((lo, hi, covered)) => {
+                let pct = covered as f64 * 100.0 / total as f64;
+                let sym = format_pc_symbol(lo, &symbols);
+                let _ = writeln!(
+                    writer,
+                    "\nidle-loop candidate: {:016x}..={:016x} ({} bytes){}  — {:.1}% of samples, interrupts enabled",
+                    lo, hi, hi - lo + 4, sym, pct
+                );
+            }
+            None => {
+                let _ = writeln!(
+                    writer,
+                    "\nno clear idle-loop candidate (no interrupts-enabled PC window covers >=50% of samples)"
+                );
+            }
+        }
+    }
+
     /// Analyze function prologue to determine frame size and RA save location
     fn analyze_prologue(&mut self, start_pc: u64, current_pc: u64) -> (u64, Option<(i64, usize)>) {
         let mut frame_size = 0u64;

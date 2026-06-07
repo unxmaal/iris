@@ -67,6 +67,14 @@ pub enum DiskBackend {
     Direct(File),
     /// Copy-on-write: base image is read-only, writes go to overlay file.
     Cow(CowDisk),
+    /// Hard-disk CHD. Writable; compressed parents get an uncompressed
+    /// `.diff.chd` sidecar (MAME-style), so the parent stays untouched.
+    #[cfg(feature = "chd")]
+    ChdHd(crate::chd_disk::ChdHd),
+    /// CD CHD (single-track MODE1) exposed as a 2048-byte/sector read-only
+    /// stream. Writes return an error.
+    #[cfg(feature = "chd")]
+    ChdCd(crate::chd_disk::ChdCd),
 }
 
 impl DiskBackend {
@@ -86,6 +94,10 @@ impl DiskBackend {
             DiskBackend::Cow(cow) => {
                 cow.read_sectors(lba, count)
             }
+            #[cfg(feature = "chd")]
+            DiskBackend::ChdHd(hd) => hd.read_blocks(lba, count, block_size),
+            #[cfg(feature = "chd")]
+            DiskBackend::ChdCd(cd) => cd.read_blocks(lba, count, block_size),
         }
     }
 
@@ -98,6 +110,13 @@ impl DiskBackend {
                 Ok(())
             }
             DiskBackend::Cow(cow) => cow.write_sectors(lba, data),
+            #[cfg(feature = "chd")]
+            DiskBackend::ChdHd(hd) => hd.write_sectors(lba, data),
+            #[cfg(feature = "chd")]
+            DiskBackend::ChdCd(_) => Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "CD CHD is read-only",
+            )),
         }
     }
 
@@ -105,15 +124,22 @@ impl DiskBackend {
         match self {
             DiskBackend::Direct(file) => file.metadata().map(|m| m.len()).unwrap_or(0),
             DiskBackend::Cow(cow) => cow.size(),
+            #[cfg(feature = "chd")]
+            DiskBackend::ChdHd(hd) => hd.size(),
+            #[cfg(feature = "chd")]
+            DiskBackend::ChdCd(cd) => cd.size(),
         }
     }
 }
 
 pub struct ScsiDevice {
-    backend: DiskBackend,
+    /// None = no media loaded (CD-ROM drive present but tray is empty).
+    /// HDDs are never None in practice.
+    backend: Option<DiskBackend>,
+    /// Capacity in bytes of the loaded media. 0 when `backend` is None.
     size: u64,
     is_cdrom: bool,
-    /// Path of the currently mounted image.
+    /// Path of the currently mounted image. Empty string when no media.
     filename: String,
     /// Full disc list for CD-ROM changers. Index 0 is always the active disc.
     /// For HDDs this is empty (unused).
@@ -135,7 +161,7 @@ const SCSI_BUFFER_SIZE: usize = 0x4000; // 16KB (16384 bytes)
 impl ScsiDevice {
     pub fn new(backend: DiskBackend, size: u64, is_cdrom: bool, filename: String, discs: Vec<String>) -> Self {
         Self {
-            backend,
+            backend: Some(backend),
             size,
             is_cdrom,
             filename,
@@ -150,52 +176,94 @@ impl ScsiDevice {
         }
     }
 
+    /// Construct an empty CD-ROM drive — drive present, no media inserted.
+    /// IRIX will see the drive in `hinv` but `TEST UNIT READY` reports
+    /// MEDIUM NOT PRESENT.
+    pub fn new_empty_cdrom() -> Self {
+        Self {
+            backend: None,
+            size: 0,
+            is_cdrom: true,
+            filename: String::new(),
+            discs: vec![],
+            buffer: vec![0u8; SCSI_BUFFER_SIZE],
+            pending_sense: [0u8; 18],
+            unit_attention: false,
+            phys_block_size: 2048,
+            logical_block_size: 2048,
+        }
+    }
+
+    /// Whether physical media is loaded. For HDDs always true; for CD-ROMs
+    /// false when the tray is empty.
+    pub fn has_media(&self) -> bool { self.backend.is_some() }
+
+    /// Mount media on a previously-empty CD-ROM, or swap the disc on a
+    /// loaded one. Sets `unit_attention` so the guest re-reads capacity.
+    pub fn insert_media(&mut self, path: &str) -> io::Result<()> {
+        let f = OpenOptions::new().read(true).open(path)?;
+        let size = f.metadata()?.len();
+        self.backend = Some(DiskBackend::Direct(f));
+        self.size = size;
+        self.filename = path.to_string();
+        self.unit_attention = true;
+        Ok(())
+    }
+
+    /// Unload media from a CD-ROM (tray empty).
+    pub fn unload_media(&mut self) {
+        self.backend = None;
+        self.size = 0;
+        self.filename = String::new();
+        self.unit_attention = true;
+    }
+
     /// Commit the COW overlay to the base image. No-op if not using COW.
-    /// Returns the number of sectors committed, or 0 if direct mode.
+    /// Returns the number of sectors committed, or 0 if direct/no media.
     pub fn cow_commit(&mut self) -> io::Result<usize> {
         match &mut self.backend {
-            DiskBackend::Cow(cow) => cow.commit(),
-            DiskBackend::Direct(_) => Ok(0),
+            Some(DiskBackend::Cow(cow)) => cow.commit(),
+            _ => Ok(0),
         }
     }
 
     /// Reset the COW overlay (discard all writes). No-op if not using COW.
     pub fn cow_reset(&mut self) -> io::Result<()> {
         match &mut self.backend {
-            DiskBackend::Cow(cow) => cow.reset_overlay(),
-            DiskBackend::Direct(_) => Ok(()),
+            Some(DiskBackend::Cow(cow)) => cow.reset_overlay(),
+            _ => Ok(()),
         }
     }
 
     /// Copy the COW overlay into `dest` and return its dirty sector set.
-    /// Direct-mode devices return an empty list and create no file.
+    /// Direct-mode / no-media devices return an empty list and create no file.
     pub fn cow_export(&mut self, dest: &std::path::Path) -> io::Result<Vec<u64>> {
         match &mut self.backend {
-            DiskBackend::Cow(cow) => cow.export_overlay(dest),
-            DiskBackend::Direct(_) => Ok(Vec::new()),
+            Some(DiskBackend::Cow(cow)) => cow.export_overlay(dest),
+            _ => Ok(Vec::new()),
         }
     }
 
     /// Replace the COW overlay with the contents of `source` and adopt
-    /// `dirty` as the dirty sector set. No-op on direct-mode devices.
+    /// `dirty` as the dirty sector set. No-op on non-COW / no-media devices.
     pub fn cow_import(&mut self, source: &std::path::Path, dirty: Vec<u64>) -> io::Result<()> {
         match &mut self.backend {
-            DiskBackend::Cow(cow) => cow.import_overlay(source, dirty),
-            DiskBackend::Direct(_) => Ok(()),
+            Some(DiskBackend::Cow(cow)) => cow.import_overlay(source, dirty),
+            _ => Ok(()),
         }
     }
 
-    /// Number of dirty sectors in the COW overlay, or 0 if direct mode.
+    /// Number of dirty sectors in the COW overlay, or 0 if direct/no media.
     pub fn cow_dirty_count(&self) -> usize {
         match &self.backend {
-            DiskBackend::Cow(cow) => cow.dirty_count(),
-            DiskBackend::Direct(_) => 0,
+            Some(DiskBackend::Cow(cow)) => cow.dirty_count(),
+            _ => 0,
         }
     }
 
     /// Whether this device is using COW overlay mode.
     pub fn is_cow(&self) -> bool {
-        matches!(&self.backend, DiskBackend::Cow(_))
+        matches!(&self.backend, Some(DiskBackend::Cow(_)))
     }
 
     /// Advance to the next disc in the list (wraps around).
@@ -213,7 +281,7 @@ impl ScsiDevice {
         match OpenOptions::new().read(true).open(&next_path) {
             Ok(f) => {
                 let size = f.metadata().map(|m| m.len()).unwrap_or(0);
-                self.backend = DiskBackend::Direct(f);
+                self.backend = Some(DiskBackend::Direct(f));
                 self.size = size;
                 // phys_block_size never changes — CD-ROM physical sectors are always 2048.
                 // Do NOT reset logical_block_size — MODE SELECT is a controller setting
@@ -239,6 +307,30 @@ impl ScsiDevice {
     /// All discs in the changer list.
     pub fn disc_list(&self) -> &[String] {
         &self.discs
+    }
+
+    /// Load an explicit image path and make it the active disc immediately,
+    /// as if a hand swapped the disc in the drive. The path is inserted at the
+    /// front of the changer list (becomes index 0) and a medium-change is
+    /// signalled (unit attention) so the guest re-reads the TOC on its next
+    /// command. The image is opened as a raw ISO (`Direct` backend), matching
+    /// the changer's eject path. Err if this is not a CD-ROM or the file can't
+    /// be opened.
+    pub fn load_disc(&mut self, path: String) -> Result<String, String> {
+        if !self.is_cdrom {
+            return Err("Not a CD-ROM device".to_string());
+        }
+        let f = OpenOptions::new().read(true).open(&path)
+            .map_err(|e| format!("could not open {}: {}", path, e))?;
+        let size = f.metadata().map(|m| m.len()).unwrap_or(0);
+        self.backend = Some(DiskBackend::Direct(f));
+        self.size = size;
+        // phys/logical block sizes persist across disc changes (controller
+        // settings), exactly as in eject_next.
+        self.filename = path.clone();
+        self.unit_attention = true; // signal medium change on next command
+        self.discs.insert(0, path.clone());
+        Ok(path)
     }
 
     /// Insert a new disc path at position 1 (next after current).
@@ -372,6 +464,10 @@ impl ScsiDevice {
             // Sense key 0x06 UNIT_ATTENTION, ASC 0x28 "Not Ready to Ready Transition / Medium Changed"
             return Ok(self.check_condition(0x06, 0x28, 0x00));
         }
+        if self.backend.is_none() {
+            // Sense key 0x02 NOT_READY, ASC 0x3A "Medium not present"
+            return Ok(self.check_condition(0x02, 0x3A, 0x00));
+        }
         Ok(ScsiResponse {
             status: 0x00,
             data: vec![],
@@ -427,7 +523,10 @@ impl ScsiDevice {
         })
     }
 
-    fn exec_read_capacity_10(&self, _cdb: &[u8]) -> Result<ScsiResponse, std::io::Error> {
+    fn exec_read_capacity_10(&mut self, _cdb: &[u8]) -> Result<ScsiResponse, std::io::Error> {
+        if self.backend.is_none() {
+            return Ok(self.check_condition(0x02, 0x3A, 0x00)); // NOT READY / MEDIUM NOT PRESENT
+        }
         let block_size = self.logical_block_size as u32;
         let last_lba = (self.size / self.logical_block_size).saturating_sub(1) as u32;
         //eprintln!("SCSI READ CAPACITY: block_size={} last_lba={}", block_size, last_lba);
@@ -455,12 +554,15 @@ impl ScsiDevice {
     }
 
     fn perform_read(&mut self, lba: u64, count: usize) -> Result<ScsiResponse, std::io::Error> {
+        let Some(backend) = self.backend.as_mut() else {
+            return Ok(self.check_condition(0x02, 0x3A, 0x00)); // NOT READY / MEDIUM NOT PRESENT
+        };
         // Check LBA bounds before attempting I/O
         let last_lba = self.size / self.logical_block_size;
         if count > 0 && (lba >= last_lba || lba + count as u64 > last_lba) {
             return Ok(self.check_condition(0x05, 0x21, 0x00)); // Illegal Request: LBA Out of Range
         }
-        let data = self.backend.read_blocks(lba, count, self.logical_block_size)?;
+        let data = backend.read_blocks(lba, count, self.logical_block_size)?;
         let expected = count as u64 * self.logical_block_size;
         if data.len() as u64 != expected {
             eprintln!(
@@ -510,7 +612,10 @@ impl ScsiDevice {
         }
 
         // Writes always go through as 512-byte sectors (HDD path only, phys=logical=512)
-        self.backend.write_sectors(lba, data)?;
+        let Some(backend) = self.backend.as_mut() else {
+            return Ok(self.check_condition(0x02, 0x3A, 0x00));
+        };
+        backend.write_sectors(lba, data)?;
 
         Ok(ScsiResponse {
             status: 0x00,
@@ -817,6 +922,9 @@ impl ScsiDevice {
     }
 
     fn exec_read_toc_pma_atip(&mut self, cdb: &[u8]) -> Result<ScsiResponse, std::io::Error> {
+        if self.backend.is_none() {
+            return Ok(self.check_condition(0x02, 0x3A, 0x00)); // NOT READY / MEDIUM NOT PRESENT
+        }
         let msf    = (cdb[1] & 0x02) != 0;
         let format = cdb[2] & 0x0F;
 

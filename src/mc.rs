@@ -196,8 +196,16 @@ impl MemoryController {
         // Initialize CPUCTRL1: MC_HWM=0xC
         regs[(REG_CPUCTRL1 / 4) as usize] = 0x0000000C;
 
-        // Initialize SYSID: Rev C (3), EISA not present (0)
-        regs[(REG_SYSID / 4) as usize] = if guinness { 0x00000003 } else { 0x00000000 };
+        // Initialize SYSID. Rev C (3) in the low nibble. Bit 4 is documented
+        // as "EISA bus present" in docs/mc.pdf — on Indy that's clear per the
+        // spec — but the IRIX 5.3 vino driver's vino_init() checks bit 4 of
+        // SYSID at 0xBFA0001C as a gate before any further probing, and
+        // silently bails if it's clear (see
+        // rules/irix/vino-attach-via-sysid-bit4.md). Setting bit 4
+        // unconditionally lets vino_init proceed; with it set, `vlinfo`
+        // reports `vino 0` with 5 nodes (digital input = IndyCam, analog
+        // input, two memory drains, controls).
+        regs[(REG_SYSID / 4) as usize] = if guinness { 0x00000013 } else { 0x00000010 };
 
         // Initialize RPSS_DIVIDER: DIV=9, INC=3 (for 33MHz)
         // 33MHz: Divide by 10 (9+1), Increment by 3 -> 300ns per tick
@@ -490,7 +498,7 @@ impl MemoryController {
                 // Each "line" is line_zoom repetitions of line_width bytes, then stride advance.
                 if word_aligned && fill && to_host && !xlate {
                     dlog_dev!(LogModule::Mc, "MC: DMA using FILL FAST PATH (stride={})", stride);
-                    'fill_outer: while line_count > 0 {
+                    while line_count > 0 {
                         line_count -= 1;
                         let line_start = mem_vaddr;
                         let mut zc = zoom_count;

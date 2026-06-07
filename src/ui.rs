@@ -2,7 +2,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 use winit::{
-    dpi::PhysicalPosition,
     event::{ElementState, Event, KeyEvent, WindowEvent, MouseButton}, event_loop::{ControlFlow, EventLoop}, keyboard::{KeyCode, PhysicalKey}, window::{Window, WindowBuilder}
 };
 use glow::HasContext;
@@ -395,6 +394,7 @@ impl Renderer for GlRenderer {
 
 struct MouseDelta {
     accum: (f64, f64),
+    wheel: f64,
     buttons: u8,
 }
 
@@ -406,10 +406,11 @@ pub struct Ui {
     window_size: Arc<Mutex<Option<(u32, u32)>>>,
     timer_manager: Arc<TimerManager>,
     scale: u32,
+    scroll_pixels_per_line: f64,
 }
 
 impl Ui {
-    pub fn new(ps2: Arc<Ps2Controller>, rex3: Arc<Rex3>, timer_manager: Arc<TimerManager>, event_loop: &EventLoop<()>, scale: u32) -> Self {
+    pub fn new(ps2: Arc<Ps2Controller>, rex3: Arc<Rex3>, timer_manager: Arc<TimerManager>, event_loop: &EventLoop<()>, scale: u32, scroll_pixels_per_line: f64) -> Self {
         let w = 1024 * scale;
         let h = (768 + STATUS_BAR_HEIGHT as u32) * scale;
         let window_builder = WindowBuilder::new()
@@ -453,19 +454,16 @@ impl Ui {
 
         *rex3.renderer.lock() = Some(Box::new(renderer));
 
-        Self { ps2, rex3, window, window_size, timer_manager, scale }
+        Self { ps2, rex3, window, window_size, timer_manager, scale, scroll_pixels_per_line }
     }
 
     /// Run the UI event loop (blocks the current thread)
     pub fn run(self, event_loop: EventLoop<()>) {
-        let Ui { ps2, rex3, window, window_size, timer_manager, scale } = self;
+        let Ui { ps2, rex3, window, window_size, timer_manager, scale, scroll_pixels_per_line } = self;
 
         let mut mouse_grabbed = false;
         let mut rctrl_held = false;
-        // Warp-to-center mouse handling: on each real CursorMoved, accumulate
-        // delta into shared MouseDelta. A 10ms timer flushes it to PS/2.
-        let mut mouse_last: Option<PhysicalPosition<f64>> = None;
-        let mouse_delta = Arc::new(Mutex::new(MouseDelta { accum: (0.0, 0.0), buttons: 0 }));
+        let mouse_delta = Arc::new(Mutex::new(MouseDelta { accum: (0.0, 0.0), wheel: 0.0, buttons: 0 }));
 
         // 10ms recurring timer: flush accumulated mouse delta to PS/2.
         {
@@ -482,7 +480,12 @@ impl Ui {
             );
         }
 
-        event_loop.set_control_flow(ControlFlow::Poll);
+        // Wait (not Poll): block the main thread until a real input event
+        // arrives, so an idle desktop doesn't busy-spin a host core. Rendering
+        // is driven by the REX3 refresh thread (RedrawRequested below is a
+        // no-op) and mouse-flush is on timer_manager, so the event loop has no
+        // reason to tick when idle.
+        event_loop.set_control_flow(ControlFlow::Wait);
         event_loop.run(move |event, elwt| {
             match event {
                 Event::WindowEvent { event, .. } => match event {
@@ -519,32 +522,16 @@ impl Ui {
                                 let _ = window.set_cursor_grab(winit::window::CursorGrabMode::Confined);
                             }
                             window.set_cursor_visible(false);
-                            // Reset warp and delta state on grab.
-                            mouse_last = None;
                             mouse_delta.lock().accum = (0.0, 0.0);
                         }
                     }
-                    #[cfg(feature = "mouseabs")]
-                    WindowEvent::CursorMoved { position, .. } => {
+                    WindowEvent::MouseWheel { delta, .. } => {
                         if mouse_grabbed {
-                            let size = window.inner_size();
-                            let center = PhysicalPosition::new((size.width / 2) as f64, (size.height / 2) as f64);
-
-                            // Skip events at exactly center — those are our own warps.
-                            if position.x == center.x && position.y == center.y {
-                                mouse_last = Some(center);
-                            } else if let Some(last) = mouse_last {
-                                let dx = (position.x - last.x) / scale as f64;
-                                let dy = (position.y - last.y) / scale as f64;
-                                mouse_delta.lock().accum.0 += dx;
-                                mouse_delta.lock().accum.1 += dy;
-                                let _ = window.set_cursor_position(center);
-                                mouse_last = Some(center);
-                            } else {
-                                // First event after grab: warp to center, record it.
-                                let _ = window.set_cursor_position(center);
-                                mouse_last = Some(center);
-                            }
+                            let lines = match delta {
+                                winit::event::MouseScrollDelta::LineDelta(_, y) => y as f64,
+                                winit::event::MouseScrollDelta::PixelDelta(p) => p.y / scroll_pixels_per_line,
+                            };
+                            mouse_delta.lock().wheel += lines;
                         }
                     }
                     WindowEvent::Focused(false) => {
@@ -552,7 +539,6 @@ impl Ui {
                             mouse_grabbed = false;
                             let _ = window.set_cursor_grab(winit::window::CursorGrabMode::None);
                             window.set_cursor_visible(true);
-                            mouse_last = None;
                         }
                     }
                     WindowEvent::RedrawRequested => {
@@ -581,14 +567,16 @@ impl Ui {
         let mut md = mouse_delta.lock();
         let dx = md.accum.0 as i32;
         let dy = md.accum.1 as i32;
-        if require_motion && dx == 0 && dy == 0 {
+        let dz = md.wheel as i32;
+        if require_motion && dx == 0 && dy == 0 && dz == 0 {
             return;
         }
         md.accum.0 -= dx as f64;
         md.accum.1 -= dy as f64;
+        md.wheel -= dz as f64;
         let buttons = md.buttons;
         drop(md);
-        Self::send_mouse_packet(ps2, (dx as f64, dy as f64), buttons);
+        ps2.push_mouse_input(buttons, dx, dy, dz);
     }
 
     fn handle_keyboard(ps2: &Ps2Controller, rex3: &Rex3, input: KeyEvent, grabbed: &mut bool, rctrl_held: &mut bool, window: &Window) {
@@ -618,38 +606,4 @@ impl Ui {
         }
     }
 
-    fn send_mouse_packet(ps2: &Ps2Controller, delta: (f64, f64), buttons: u8) {
-        // PS/2 mouse packet (3 bytes):
-        //   Byte 0: Yovfl Xovfl Ysign Xsign 1 M R L
-        //   Byte 1: X movement (low 8 bits of 9-bit signed value)
-        //   Byte 2: Y movement (low 8 bits of 9-bit signed value)
-        // The sign bit in byte 0 is the 9th bit, giving range -256..=255.
-        // Overflow bits are set when the value exceeds that range.
-
-        let dx = delta.0 as i32;
-        let dy = -(delta.1 as i32); // PS/2 Y is bottom-to-top
-
-        // Split movements that exceed the 9-bit signed range (-256..=255).
-        let max_axis = dx.unsigned_abs().max(dy.unsigned_abs()) as i32;
-        let limit = 255i32;
-        let steps = if max_axis > limit { (max_axis + limit - 1) / limit } else { 1 };
-        let step_x = dx / steps;
-        let step_y = dy / steps;
-        let rem_x = dx - step_x * (steps - 1);
-        let rem_y = dy - step_y * (steps - 1);
-
-        let mut send = |sx: i32, sy: i32| {
-            let mut b0 = 0x08u8 | (buttons & 0x07);
-            if sx < 0 { b0 |= 0x10; }
-            if sy < 0 { b0 |= 0x20; }
-            if sx < -256 || sx > 255 { b0 |= 0x40; }
-            if sy < -256 || sy > 255 { b0 |= 0x80; }
-            ps2.push_mouse_packet(b0, sx as u8, sy as u8);
-        };
-
-        for _ in 0..steps - 1 {
-            send(step_x, step_y);
-        }
-        send(rem_x, rem_y);
-    }
 }

@@ -1,0 +1,30 @@
+[package]
+name = "iris-gui"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Group A (additive) features are always on for iris-gui so the user can
+# enable them at runtime via the config UI: chd (.chd disk paths), camera
+# (vino source), jit (IRIS_JIT toggle), rex-jit. They add code paths and
+# native dependencies but no runtime cost when unused.
+iris = { path = "..", features = ["chd", "camera", "jit", "rex-jit"] }
+eframe = { version = "0.29", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui = "0.29"
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+# Match iris's winit version — Ps2Controller::push_kb takes
+# winit::keyboard::KeyCode.
+winit = "0.29"
+png = "0.17"
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+dirs = "5"
+log = "0.4"
+env_logger = "0.10"
+
+[[bin]]
+name = "iris-gui"
+path = "src/main.rs"

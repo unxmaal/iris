@@ -1,60 +1,49 @@
-# Claude Instructions
+# Claude Instructions — IRIS
 
-## INVARIANTS (non-negotiable)
+IRIS is an SGI Indy (MIPS R4400) emulator written in Rust. It boots IRIX 6.5
+and 5.3 to a usable system (shell, networking, X11). It is **not** cycle-accurate
+— IRIX doesn't need it and accuracy would only make it slower.
 
-These are hard rules. Violating any of these is a session failure.
+## Read these first
 
-- **MCP TOOLS BEFORE EVERYTHING**: `search` first!! `search` everything before you do it so you don't flail around.`report_error` before attempting any fix. `check_compat` before writing any compat function. `search` before inventing any technique. NO EXCEPTIONS. Do not skip these because you think you already know the answer — your training data for IRIX is outdated and wrong. **ENFORCED AT TWO LEVELS**: (1) The knowledge MCP tracks MCP tool calls — warning at turn 3, blocking at turn 6+ (nudge_escalation_threshold=2). (2) A Claude Code PreToolUse hook tracks built-in tool calls (Edit, Write, Bash) — warning after 8 calls without MCP search, **Edit/Write BLOCKED after 20 calls**. The hook catches the blind spot where the MCP nudge system can't see built-in tools. Both levels reset when you call search/report_error/check_compat.
-- **NO FIXES OUTSIDE MOGRIX RULES**: Every fix goes into `rules/`, `compat/`, or `patches/`. If you `sed` a file during debugging, that fix MUST end up in a YAML rule. If it doesn't, you have failed.
-- **NO INLINE C IN YAML**: C files go in `patches/packages/<pkg>/`, referenced via `add_source`. No heredocs generating .c/.h files in `prep_commands`.
-- **`add_rule` IMMEDIATELY AFTER FIX CONFIRMED**: The moment a build passes after a fix, call `add_rule` with `file_path` pointing to the authoritative rule file. Do not batch to session end — context pressure causes deferred `add_rule` calls to be dropped.
-- **DB IS CACHE, FILES ARE AUTHORITATIVE**: Rule files (`rules/packages/*.yaml`, `rules/generic.yaml`, `compat/catalog.yaml`, `rules/methods/*.md`) are the source of truth. `add_rule` must include `file_path`.
-- **DELEGATE LONG DEBUGS**: >2 failed fix attempts for the same error → stop and spawn a sub-agent with `Task()`. Pass it the error text, file paths, and tell it to use MCP tools first. Never let debug trace flood parent context.
-- **REDIRECT BUILD OUTPUT**: Never let rpmbuild output flood context. Log to file. Use sub-agents (`Task(model="haiku")`) for reading large build logs.
-- **INVOCATION**: `uv run mogrix <command>`. No other invocation method works.
+- `HACKING.md` — architecture: data path/endianness, concurrency model, the
+  MC bus/device/port abstraction. **Read before touching device or CPU code.**
+- `HELP.md` — running it: serial ports, monitor console, NVRAM/MAC setup, disk
+  image prep.
+- `README.md` — overview, feature flags, current status.
+- `docs/` — per-device notes (hal2, rex3, irix-install, …).
+- `rules/` — accumulated, hard-won findings about emulator behaviour
+  (`jit/`, `snapshot/`, `irix/`, `testing/`). Check here before re-deriving a
+  gotcha; when you confirm a non-obvious fix, write it up here as a short
+  markdown note so the next session doesn't relearn it.
 
----
+## Build & run
 
-## Session Protocol
+```
+cargo run --release                                       # interpreter
+cargo run --release --features lightning,rex-jit,tlbvmap  # recommended for speed
+IRIS_JIT=1 cargo run --release --features jit             # enable MIPS JIT
+```
 
-1. Call `session_start` MCP tool
-2. Work — use MCP tools for every error, every symbol, every lookup
-3. `add_rule` immediately after each confirmed fix
-4. Call `session_handoff` MCP tool before ending
+Binaries: `iris` (the emulator), `iris-ci` (CI/automation socket client),
+`coffdump`, `chd_extract`. Feature flags and `IRIS_JIT_*` env vars are
+documented in `README.md`.
 
----
+## Hard invariants (from HACKING.md)
 
-## MCP Tool Quick Reference
+- **Endianness lives only at "The Edge."** Host `u32`/`u64` are bit-containers;
+  byte-swapping happens at PROM/disk I/O via `swap_on_load`, never in CPU/bus/MC
+  logic. **Do not suggest `.to_be()` / `.to_le()` for memory or register code.**
+- **Concurrency is per-device.** CPU, REX3, SCSI, and ethernet run on their own
+  threads and lock their own state. Deadlocks live in callbacks *up* to a parent
+  device (e.g. SCSI → HPC3) — be careful there.
 
-These are your primary interface. Use them before reading files, before grepping, before guessing.
+## Automation & CI
 
-| When | Tool | What it does |
-|------|------|--------------|
-| Hit any error | `report_error` | Logs error AND auto-searches rules+compat+errors in one call |
-| Need to look something up | `search` (or `knowledge_query`) | FTS5 search across all knowledge, rules, errors, negative knowledge |
-| Confirmed a fix | `add_rule` | Stores the fix with `file_path` to authoritative rule file |
-| Learned something | `add_knowledge` (or `report_finding`) | Stores findings, decisions, insights |
-| Found a dead end | `add_negative` | Stores anti-patterns so they're never repeated |
-| Session start | `session_start` | Context summary, last handoff, active tasks |
-| Session end | `session_handoff` | Snapshot state for next session |
-
-
-## Context Management
-
-**Tuned for 1M context (Opus 4.6).** Sessions can safely run 400+ turns. Compaction/handoff urgency is low. Focus is on knowledge capture quality, not checkpoint frequency.
-
-- **Sub-agents for investigation**: Any task requiring >200 lines of output gets a sub-agent. `Task(model="haiku")` for build log reading. Sub-agent investigates and returns a concise summary; parent applies the fix.
-- **Re-orientation check every 8 tool calls**: Am I using MCP tools? Am I freestyling a fix that's probably already documented? Have I stored my findings? If unsure, call `session_start`.
-- **Store knowledge continuously**: `report_error` when you hit it → fix it → build passes → `add_rule` right then. Don't accumulate findings to store later. The nudge system fires a store reminder after 6 turns without a store.
-- **Checkpoint at 30 turns**: `save_snapshot` or `session_handoff` to reset the checkpoint counter. Mandatory stop at 60 turns (enforced, blocks all tools).
-- **Batch builds**: Max 2-3 background agents, each with its own rpmbuild directory. Only the orchestrator updates rule files. See `rules/methods/task-tracking.md`.
-
-**MCP enforcement thresholds** (mcm-engine.yaml):
-- Store reminder: 6 turns
-- Checkpoint: 30 turns
-- Mandatory stop: 60 turns (+10 grace)
-- Nudge escalation: 2 ignores → blocking
-- MCP-first enforcement: warning at turn 3, blocks at turn ~7 if no search/report_error/check_compat called
-
----
-
+- `iris-ci` is the canonical socket interface for driving a running emulator
+  (snapshots, scripted input, headless runs). Prefer it over ad-hoc serial
+  poking. See `rules/snapshot/` and `manual_test_runbook.md`.
+- Install IRIX only from original media (see `docs/irix-install.md`). Never use a
+  pre-built MAME CHD as a shortcut.
+- After changing PROM env (`setenv`/`unsetenv`) or NVRAM, run `rtc save` from the
+  monitor console before halting, or the change is lost.

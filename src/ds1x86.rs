@@ -23,10 +23,15 @@ struct RtcData {
 pub struct Ds1x86 {
     data: Mutex<RtcData>,
     size: usize,
+    /// On-disk NVRAM path, used by `load_nvram` at startup and by
+    /// `rtc-save` as the default destination. Wired from
+    /// `MachineConfig::nvram` so different toml configs can use
+    /// independent NVRAM files.
+    nvram_path: String,
 }
 
 impl Ds1x86 {
-    pub fn new(size: usize) -> Self {
+    pub fn new(size: usize, nvram_path: String) -> Self {
         // DS1286: 64 bytes, regs at 0
         // DS1386: 8K/32K, regs at 0 (first 16 bytes)
         let rtc = Self {
@@ -36,6 +41,7 @@ impl Ds1x86 {
                 time_base: Instant::now(),
             }),
             size,
+            nvram_path,
         };
 
         // Initialize with current time
@@ -46,12 +52,17 @@ impl Ds1x86 {
         drop(data);
 
         // Load NVRAM if exists
-        if Path::new("nvram.bin").exists() {
-            let _ = rtc.load_nvram("nvram.bin");
-            dlog!(LogModule::Rtc, "RTC: Loaded NVRAM from nvram.bin");
+        if Path::new(&rtc.nvram_path).exists() {
+            let _ = rtc.load_nvram(&rtc.nvram_path);
+            dlog!(LogModule::Rtc, "RTC: Loaded NVRAM from {}", rtc.nvram_path);
         }
 
         rtc
+    }
+
+    /// Default save path for this NVRAM (the same file we loaded from).
+    pub fn nvram_path(&self) -> &str {
+        &self.nvram_path
     }
 
     fn to_bcd(val: u8) -> u8 {
@@ -190,12 +201,12 @@ impl Ds1x86 {
         let mut data = self.data.lock();
         let len = std::cmp::min(data.regs.len(), buffer.len());
         data.regs[..len].copy_from_slice(&buffer[..len]);
-        
+
         // Update time base to current time (simulate battery backed clock continuing)
         self.set_current_time(&mut data.regs);
         data.base_centiseconds = self.regs_to_centiseconds(&data.regs, 0);
         data.time_base = Instant::now();
-        
+
         Ok(())
     }
 
@@ -309,7 +320,7 @@ impl Device for Ds1x86 {
                     return Ok(());
                 }
                 "save" => {
-                    let filename = if args.len() > 1 { args[1] } else { "nvram.bin" };
+                    let filename = if args.len() > 1 { args[1] } else { self.nvram_path.as_str() };
                     match self.save_nvram(filename) {
                         Ok(_) => { writeln!(writer, "Saved NVRAM to {}", filename).unwrap(); return Ok(()); },
                         Err(e) => return Err(format!("Failed to save NVRAM: {}", e)),
@@ -404,7 +415,7 @@ mod tests {
     /// into regs when TE is set, so we clear TE first to make the test stable.
     #[test]
     fn save_load_round_trip() {
-        let src = Ds1x86::new(8192);
+        let src = Ds1x86::new(8192, "nvram.bin".to_string());
         // Disable transfer-enable so save_state doesn't tick the clock between
         // calls; mutate a few NVRAM bytes outside the time-keeping registers.
         {
@@ -416,7 +427,7 @@ mod tests {
         }
         let v1 = src.save_state();
 
-        let dst = Ds1x86::new(8192);
+        let dst = Ds1x86::new(8192, "nvram.bin".to_string());
         dst.load_state(&v1).expect("load_state");
         // Same: clear TE on dst before re-serializing so its save_state path
         // matches src's behavior. (load_state preserves the TE bit from v1, so

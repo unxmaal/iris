@@ -9,7 +9,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use crate::config::{ForwardBind, ForwardProto, NfsConfig, PortForwardConfig};
+use crate::config::{ForwardBind, ForwardProto, NatSubnet, NfsConfig, PortForwardConfig};
 use crate::devlog::LogModule;
 use parking_lot::{Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -30,7 +30,13 @@ const UDP_PORT_BOOTP_SERVER: u16 = 67;
 const UDP_PORT_BOOTP_CLIENT: u16 = 68;
 const UDP_PORT_DNS:          u16 = 53;
 const UDP_PORT_PORTMAP:      u16 = 111;
+const UDP_PORT_TIME:         u16 = 37;
+const UDP_PORT_NTP:          u16 = 123;
+const TCP_PORT_TIME:         u16 = 37;
 const BOOTP_OP_REQUEST: u8      = 1;
+
+// Seconds between 1900-01-01 (NTP/RFC868 epoch) and 1970-01-01 (Unix epoch).
+const NTP_EPOCH_OFFSET: u64 = 2_208_988_800;
 
 // NFS-visible ports (what IRIX thinks the server is on)
 const NFS_VM_PORT:    u16 = 2049;
@@ -58,13 +64,14 @@ pub struct GatewayConfig {
 
 impl Default for GatewayConfig {
     fn default() -> Self {
+        let subnet = NatSubnet::default();
         Self {
-            gateway_mac: [0x02, 0x00, 0xDE, 0xAD, 0xBE, 0xEF],
-            gateway_ip:  Ipv4Addr::new(192, 168, 0, 1),
-            client_ip:   Ipv4Addr::new(192, 168, 0, 2),
-            netmask:     Ipv4Addr::new(255, 255, 255, 0),
+            gateway_mac:  [0x02, 0x00, 0xDE, 0xAD, 0xBE, 0xEF],
+            gateway_ip:   subnet.gateway_ip,
+            client_ip:    subnet.client_ip,
+            netmask:      subnet.netmask,
             dns_upstream: "8.8.8.8:53".parse().unwrap(),
-            nfs: None,
+            nfs:          None,
             port_forwards: vec![],
         }
     }
@@ -129,6 +136,16 @@ fn ip_checksum(data: &[u8]) -> u16 {
     if i < data.len() { s += (data[i] as u32) << 8; }
     while s >> 16 != 0 { s = (s & 0xffff) + (s >> 16); }
     !(s as u16)
+}
+
+fn icmp_socket() -> std::io::Result<Socket> {
+    let new = |t| Socket::new(Domain::IPV4, t, Some(Protocol::ICMPV4));
+    #[cfg(target_os = "linux")]
+    { new(Type::DGRAM) }
+    #[cfg(target_os = "macos")]
+    { new(Type::DGRAM).or_else(|_| new(Type::RAW)) }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    { new(Type::RAW) }
 }
 
 fn ipv4_header(src: Ipv4Addr, dst: Ipv4Addr, proto: u8, payload_len: u16) -> [u8; 20] {
@@ -540,7 +557,7 @@ pub struct NatEngine {
     tcp_nat:   HashMap<(u32, u16, u16), NatTcpEntry>,
     tcp_tw:    HashMap<(u32, u16, u16), Instant>,  // TIME_WAIT: absorb final ACKs silently
     icmp_nat:  HashMap<(u32, u16), NatIcmpEntry>,  // key: (dst_ip, identifier)
-    icmp_unavailable: bool,  // true after first failed raw socket creation (Windows non-admin)
+    icmp_unavailable: bool,  // true after first failed ICMP socket creation
     // Replies generated while draining TX frames are deferred to the next loop iteration
     // so they don't race with the TX completion interrupt in IRIX's interrupt handler.
     deferred_rx: Vec<Vec<u8>>,
@@ -812,7 +829,9 @@ impl NatEngine {
         // Forward to external host via ICMP socket.
         // Linux: unprivileged SOCK_DGRAM+ICMPV4 works (kernel ≥3.11) but Time Exceeded
         //   replies are not delivered — traceroute sees * * * for intermediate hops.
-        // macOS: SOCK_DGRAM+ICMPV4 requires root; falls back gracefully if unavailable.
+        // macOS: unprivileged SOCK_DGRAM+ICMPV4 works for any user and — unlike Linux —
+        //   recv yields the full IP header and delivers Time Exceeded, so it behaves like
+        //   SOCK_RAW; falls back to SOCK_RAW (root) only if DGRAM is unavailable.
         // Windows: SOCK_RAW+ICMPV4 requires admin; Time Exceeded IS delivered on recv,
         //   so traceroute works correctly when running as Administrator.
         let is_new = !self.icmp_nat.contains_key(&(u32::from(dst_ip), ident));
@@ -821,22 +840,13 @@ impl NatEngine {
         if self.icmp_unavailable { return; }
         let key = (u32::from(dst_ip), ident);
         let entry = self.icmp_nat.entry(key).or_insert_with(|| {
-            // Linux: unprivileged SOCK_DGRAM+ICMPV4 works (kernel ≥3.11).
-            // Windows/macOS: need SOCK_RAW+ICMPV4, which requires admin/root.
-            #[cfg(target_os = "linux")]
-            let sock_type = Type::DGRAM;
-            #[cfg(not(target_os = "linux"))]
-            let sock_type = Type::RAW;
-            let sock = match Socket::new(Domain::IPV4, sock_type, Some(Protocol::ICMPV4)) {
+            let sock = match icmp_socket() {
                 Ok(s) => { let _ = s.set_nonblocking(true); Some(s) }
                 Err(e) => {
                     #[cfg(windows)]
                     eprintln!("iris: ICMP unavailable ({}); ping will time out. \
                         Run as Administrator to enable raw ICMP.", e);
-                    #[cfg(target_os = "macos")]
-                    eprintln!("iris: ICMP unavailable ({}); ping will time out. \
-                        Run as root (sudo) to enable raw ICMP.", e);
-                    #[cfg(target_os = "linux")]
+                    #[cfg(not(windows))]
                     eprintln!("iris: ICMP unavailable ({}); ping will time out.", e);
                     None
                 }
@@ -850,8 +860,8 @@ impl NatEngine {
         entry.last_use = Instant::now();
         let sock = entry.sock.as_ref().unwrap();
         // Preserve the guest's TTL so intermediate routers respond with Time Exceeded
-        // at the right hop count.  On Windows/macOS (SOCK_RAW) those replies arrive back
-        // on this socket and we forward them to the guest.  On Linux (SOCK_DGRAM) they
+        // at the right hop count.  On Windows (SOCK_RAW) and macOS (SOCK_DGRAM) those
+        // replies arrive back on this socket and we forward them to the guest.  On Linux they
         // are silently dropped by the kernel — traceroute sees * * *.
         let _ = sock.set_ttl(ttl as u32);
         let dest = SocketAddr::new(IpAddr::V4(dst_ip), 0);
@@ -870,8 +880,8 @@ impl NatEngine {
             let mut buf = [std::mem::MaybeUninit::<u8>::uninit(); 1500];
             while let Ok(n) = sock.recv(&mut buf) {
                 let raw: Vec<u8> = buf[..n].iter().map(|b| unsafe { b.assume_init() }).collect();
-                // On Linux SOCK_DGRAM the kernel delivers only the ICMP payload.
-                // On Windows/macOS SOCK_RAW the kernel prepends the outer IP header.
+                // On Linux (SOCK_DGRAM) the kernel delivers only the ICMP payload.
+                // On Windows (SOCK_RAW) and macOS (SOCK_DGRAM) it prepends the outer IP header.
                 #[cfg(not(target_os = "linux"))]
                 let (outer_src_u32, icmp) = {
                     let ihl = ((raw.first().copied().unwrap_or(0x45) & 0x0f) as usize) * 4;
@@ -890,7 +900,7 @@ impl NatEngine {
             let (dst_ip_u32, ident) = key;
             let icmp_type = icmp[0];
 
-            // On Windows/macOS (SOCK_RAW) we receive Time Exceeded (type 11) for traceroute hops.
+            // On Windows (SOCK_RAW) and macOS (SOCK_DGRAM) we receive Time Exceeded (type 11) for traceroute hops.
             // The payload of a Time Exceeded is: [unused 4B][original IP hdr][orig 8B].
             // We match via the ident embedded in the original probe's first 8 bytes,
             // rewrite the embedded src IP back to the guest IP, and forward to guest.
@@ -972,6 +982,10 @@ impl NatEngine {
             UDP_PORT_DNS          => self.forward_dns(src_mac, src_ip, sport, payload),
             UDP_PORT_PORTMAP if self.config.nfs.is_some()
                               => self.handle_portmap_udp(src_mac, src_ip, sport, payload),
+            UDP_PORT_TIME if dst_ip == self.config.gateway_ip
+                              => self.handle_time_udp(src_mac, src_ip, sport),
+            UDP_PORT_NTP  if dst_ip == self.config.gateway_ip
+                              => self.handle_ntp_udp(src_mac, src_ip, sport, payload),
             _ => {
                 // NFS/mountd: rewrite destination to localhost high port before NAT.
                 let real_dst = self.nfs_remap_dst(dst_ip, dport);
@@ -1053,6 +1067,92 @@ impl NatEngine {
                                  self.config.gateway_ip, client_ip, IP_PROTO_UDP, &udp);
             self.enqueue_rx(frame);
         }
+    }
+
+    // ── Time services (RFC 868 + NTP) ─────────────────────────────────────────
+
+    /// RFC 868: 32-bit big-endian seconds since 1900-01-01 00:00:00 UTC.
+    fn rfc868_time() -> [u8; 4] {
+        let unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        ((unix + NTP_EPOCH_OFFSET) as u32).to_be_bytes()
+    }
+
+    /// 64-bit NTP timestamp: seconds.fraction since 1900-01-01 UTC.
+    fn ntp_timestamp() -> u64 {
+        let d = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let secs = d.as_secs() + NTP_EPOCH_OFFSET;
+        let frac = ((d.subsec_nanos() as u64) << 32) / 1_000_000_000;
+        (secs << 32) | frac
+    }
+
+    fn handle_time_udp(&mut self, client_mac: &[u8; 6], client_ip: Ipv4Addr, client_port: u16) {
+        let payload = Self::rfc868_time();
+        dlog_dev!(LogModule::Net, "NAT TIME(udp) → {}:{}", client_ip, client_port);
+        let udp = udp_packet(self.config.gateway_ip, client_ip,
+                             UDP_PORT_TIME, client_port, &payload);
+        let frame = ip_frame(client_mac, &self.config.gateway_mac,
+                             self.config.gateway_ip, client_ip, IP_PROTO_UDP, &udp);
+        self.enqueue_rx(frame);
+    }
+
+    fn handle_ntp_udp(&mut self, client_mac: &[u8; 6], client_ip: Ipv4Addr,
+                     client_port: u16, query: &[u8]) {
+        if query.len() < 48 { return; }
+        // Echo client's transmit timestamp (offset 40..48) into originate (offset 24..32).
+        let client_tx: [u8; 8] = query[40..48].try_into().unwrap();
+        dlog_dev!(LogModule::Net, "NAT NTP → {}:{}", client_ip, client_port);
+
+        let mut pkt = [0u8; 48];
+        // LI=0, VN=4, Mode=4 (server).
+        pkt[0]  = (0 << 6) | (4 << 3) | 4;
+        pkt[1]  = 1;                                // stratum=1 (primary)
+        pkt[2]  = 4;                                // poll interval (log2 16s)
+        pkt[3]  = 0xEC;                             // precision ~ 2^-20s
+        // root delay / dispersion = 0 (already)
+        pkt[12..16].copy_from_slice(b"LOCL");       // reference identifier
+        let recv = Self::ntp_timestamp();
+        pkt[16..24].copy_from_slice(&recv.to_be_bytes()); // reference timestamp
+        pkt[24..32].copy_from_slice(&client_tx);          // originate (echoed)
+        pkt[32..40].copy_from_slice(&recv.to_be_bytes()); // receive timestamp
+        let tx = Self::ntp_timestamp();
+        pkt[40..48].copy_from_slice(&tx.to_be_bytes());   // transmit timestamp
+
+        let udp = udp_packet(self.config.gateway_ip, client_ip,
+                             UDP_PORT_NTP, client_port, &pkt);
+        let frame = ip_frame(client_mac, &self.config.gateway_mac,
+                             self.config.gateway_ip, client_ip, IP_PROTO_UDP, &udp);
+        self.enqueue_rx(frame);
+    }
+
+    /// RFC 868 over TCP: full SYN-ACK / data / FIN sequence in one shot.
+    fn handle_time_tcp(&mut self, client_mac: &[u8; 6], client_ip: Ipv4Addr,
+                       client_port: u16, client_seq: u32) {
+        let gw   = self.config.gateway_ip;
+        let gmac = self.config.gateway_mac;
+        let server_isn = 0x6000_0000u32;
+        let payload = Self::rfc868_time();
+        dlog_dev!(LogModule::Net, "NAT TIME(tcp) → {}:{}", client_ip, client_port);
+        // SYN-ACK
+        let seg = tcp_segment(gw, client_ip, TCP_PORT_TIME, client_port,
+                              server_isn, client_seq, 0x12, &[]);
+        let frame = ip_frame(client_mac, &gmac, gw, client_ip, IP_PROTO_TCP, &seg);
+        self.enqueue_rx(frame);
+        // Data + PSH+ACK
+        let seg = tcp_segment(gw, client_ip, TCP_PORT_TIME, client_port,
+                              server_isn.wrapping_add(1), client_seq, 0x18, &payload);
+        let frame = ip_frame(client_mac, &gmac, gw, client_ip, IP_PROTO_TCP, &seg);
+        self.enqueue_rx(frame);
+        // FIN+ACK
+        let seg = tcp_segment(gw, client_ip, TCP_PORT_TIME, client_port,
+                              server_isn.wrapping_add(1 + payload.len() as u32),
+                              client_seq, 0x11, &[]);
+        let frame = ip_frame(client_mac, &gmac, gw, client_ip, IP_PROTO_TCP, &seg);
+        self.enqueue_rx(frame);
     }
 
     // ── NFS destination remapping ─────────────────────────────────────────────
@@ -1283,6 +1383,16 @@ impl NatEngine {
             }
         }
 
+        // Intercept RFC 868 time TCP (port 37) — handle inline, no NAT entry.
+        // On SYN we send SYN-ACK + the 4-byte timestamp + FIN in one burst.
+        // Subsequent ACK/FIN from guest are absorbed silently.
+        if dport == TCP_PORT_TIME && dst_ip == self.config.gateway_ip {
+            if syn && !ack {
+                self.handle_time_tcp(client_mac, src_ip, sport, seq.wrapping_add(1));
+            }
+            return;
+        }
+
         // Intercept portmap TCP (port 111) — handle inline, never hits the NAT table.
         if dport == UDP_PORT_PORTMAP && self.config.nfs.is_some() {
             if syn && !ack {
@@ -1302,7 +1412,15 @@ impl NatEngine {
         }
 
         // NFS/mountd: rewrite destination to localhost high port.
-        let (dst_ip, dport) = self.nfs_remap_dst(dst_ip, dport);
+        // Don't remap if this port already has a tcp_nat entry keyed on the
+        // original dst — port-forward entries use gateway_ip as the key and
+        // the generic loopback remap would cause a key miss on follow-on packets.
+        let pre_remap_key = (u32::from(dst_ip), dport, sport);
+        let (dst_ip, dport) = if self.tcp_nat.contains_key(&pre_remap_key) {
+            (dst_ip, dport)
+        } else {
+            self.nfs_remap_dst(dst_ip, dport)
+        };
 
         let key = (u32::from(dst_ip), dport, sport);
 

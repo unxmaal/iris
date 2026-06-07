@@ -271,7 +271,14 @@ impl Physical {
         let unmapped_ram = UnmappedRam;
         let alias_bus = AliasBus::new(std::ptr::null::<ErrorBus>(), ALIAS_OFFSET);
         // VINO GIO alias: 0x1F08xxxx → 0x0008xxxx (subtract 0x1F000000 = add 0xFF000000)
-        let vino_gio_alias = AliasBus::new(std::ptr::null::<ErrorBus>(), 0xFF000000u32);
+        // GIO64 VINO aperture sits at 0x1F080000; the chip's primary registers
+        // live at physical 0x00080000 (VINO_BASE). To map 0x1F080000 → 0x00080000
+        // via wrapping_add we need offset = -(0x1F000000) = 0xE1000000.
+        // (Previously 0xFF000000 here, which is -(0x01000000), so vino probes
+        // through the GIO alias landed at 0x1E080000 — gio_err_ptr region —
+        // returning 0xFFFFFFFF. The IRIX vino driver's chip_id check then
+        // mismatches and no /hw/.../vino node is created.)
+        let vino_gio_alias = AliasBus::new(std::ptr::null::<ErrorBus>(), 0xE1000000u32);
         let black_hole = BlackHoleRegion::new();
 
         // Initialize lookup table with null - will be filled in init()
@@ -344,6 +351,19 @@ impl Physical {
 
         // 2nd hpc
         for i in (0x1F980000 >> 16)..((0x1F990000 - 1) >> 16) + 1 {
+            self.device_map[i as usize] = black_hole_ptr;
+        }
+
+        // HPC1 region (0x1FB00000–0x1FB80000) — older HPC chip iris doesn't
+        // emulate. IRIX still probes here during normal operation (visible as
+        // `MC: CPU Error at 1fb02000` etc. in stderr) and usually tolerates
+        // the bus error. Once vidtomem activates the vino capture pipeline,
+        // a kernel access here escalates to a hard panic
+        // ("PANIC: IRIX Killed due to Bus Error"). Mapping the region to the
+        // black hole (reads as zero, writes silently accepted) prevents the
+        // bus error from firing and avoids the panic — without implementing
+        // real HPC1 semantics, which would be a much larger emulation gap.
+        for i in (0x1FB00000u32 >> 16)..((HPC3_BASE - 1) >> 16) + 1 {
             self.device_map[i as usize] = black_hole_ptr;
         }
 

@@ -6,7 +6,7 @@ use std::net::TcpStream;
 use std::sync::mpsc;
 use std::thread;
 
-use crate::config::MachineConfig;
+use crate::config::{MachineConfig, NetworkConfig};
 use crate::traits::{BusDevice, Device, Resettable, Saveable, MachineEvent};
 use crate::locks::LockMonitor;
 use crate::eeprom_93c56::Eeprom93c56;
@@ -31,7 +31,7 @@ use crate::hpc3::Hpc3;
 use crate::ioc::Ioc;
 use crate::monitor::Monitor;
 use crate::rex3::Rex3;
-use crate::snapshot::{Snapshot, Manifest, SCHEMA_VERSION, ChunksManifest};
+use crate::snapshot::{Snapshot, Manifest, SCHEMA_VERSION, ChunksManifest, DiskRef, enabled_features};
 use crate::chunk_store::{ChunkStore, get_chunks_as_words, put_words_as_chunks};
 use crate::hptimer::TimerManager;
 
@@ -87,6 +87,12 @@ pub struct Machine {
     /// inject/exfiltrate files without going through the network. None when no
     /// SCSI device has `scratch = true` set in the config.
     scratch_path: Option<std::path::PathBuf>,
+    /// Disk provenance captured at construction (configured path + host file
+    /// size per SCSI id). Written into snapshot manifests and validated on
+    /// restore so captured state never lands on a different base disk.
+    disks: Vec<DiskRef>,
+    /// Configured nvram file path, recorded in snapshot manifests.
+    nvram_path: String,
 }
 
 /// In-memory snapshot of the just-restored guest state. Populated at the end
@@ -130,6 +136,15 @@ impl Machine {
 
         // 0. Shared EEPROM
         let eeprom = Arc::new(Mutex::new(Eeprom93c56::new()));
+        // CACHSZ_REG (word 0x11): secondary cache size in 4KB pages.
+        // PROM reads this when SC=1 (size_2nd_cache probe returns 0) to determine L2 size.
+        // r5ksc without r5ksc_triton: external SC sized via EEPROM. 256 = 1MB (256 × 4KB).
+        // r5ksc_triton: Triton reports L2 size via CONFIG_TR_SS — EEPROM word left 0.
+        // r5k without r5ksc: no L2 — leave 0 so PROM sees no secondary cache.
+        #[cfg(all(feature = "r5ksc", not(feature = "r5ksc_triton")))]
+        eeprom.lock().set_cachsz((crate::mips_cache_v2::L2_SIZE / 4096) as u16);
+        #[cfg(all(feature = "r5k", not(feature = "r5ksc")))]
+        eeprom.lock().set_cachsz(0);
 
         // 1. Create all devices first
         // Memory Controller
@@ -168,15 +183,38 @@ impl Machine {
         // current backend Arc into the RX/TX threads).
         let ci_serial = if ci_enabled {
             let b = Arc::new(crate::z85c30::CiSerialBackend::new());
+            if let Some(path) = cfg.serial_log.as_deref() {
+                if let Err(e) = b.set_log_file(path) {
+                    eprintln!("iris: serial_log: failed to open {}: {}", path, e);
+                } else {
+                    eprintln!("iris: serial console mirroring to {}", path);
+                }
+            }
             ioc.scc().set_backend_b(b.clone());
             Some(b)
         } else {
+            // Non-CI mode: channel B already has its TCP listener on
+            // 127.0.0.1:8881.  If --serial-log was passed, wrap it in a
+            // TeeBackend so guest-emitted bytes get mirrored to the file
+            // in addition to whatever client is attached to the TCP socket.
+            if let Some(path) = cfg.serial_log.as_deref() {
+                let inner = ioc.scc().backend_b();
+                match crate::z85c30::TeeBackend::new(inner, path) {
+                    Ok(tee) => {
+                        ioc.scc().set_backend_b(Arc::new(tee));
+                        eprintln!("iris: serial console mirroring to {}", path);
+                    }
+                    Err(e) => {
+                        eprintln!("iris: serial_log: failed to open {}: {}", path, e);
+                    }
+                }
+            }
             None
         };
         let timer_manager = Arc::new(TimerManager::new());
         ioc.set_timer_manager(timer_manager.clone());
         ioc.set_heartbeat(heartbeat.clone());
-        let hpc3 = Hpc3::with_nfs(eeprom.clone(), ioc.clone(), true, heartbeat.clone(), cfg.nfs.clone(), cfg.port_forward.clone(), cfg.no_audio);
+        let hpc3 = Hpc3::with_net(eeprom.clone(), ioc.clone(), true, heartbeat.clone(), cfg.network(), cfg.no_audio, cfg.nvram.clone());
         hpc3.set_timer_manager(timer_manager.clone());
 
         // Attach SCSI devices from config (IDs 1–7).
@@ -244,9 +282,25 @@ impl Machine {
                 hpc3.add_scsi_device(id as usize, &path, dev.cdrom, discs, dev.overlay)
             };
             if let Err(e) = result {
-                println!("Note: Could not attach {} to SCSI ID {}: {}", path, id, e);
+                // A configured disk that won't attach is fatal: continuing would
+                // boot with a silently-missing device, and the only symptom is a
+                // confusing PROM "no such device" much later (e.g. a CHD path
+                // when the binary was built without --features chd). Fail loudly
+                // at startup instead.
+                eprintln!("iris: fatal: could not attach {} to SCSI ID {}: {}", path, id, e);
+                std::process::exit(1);
             }
         }
+
+        // Disk + nvram provenance for snapshot manifests. Captured here while
+        // the MachineConfig `cfg` is still in scope (it is shadowed by the CPU
+        // config below). Identity is the configured path + host file size.
+        let mut disk_provenance: Vec<DiskRef> = cfg.scsi.iter().map(|(&id, dev)| {
+            let size_bytes = std::fs::metadata(&dev.path).map(|m| m.len()).unwrap_or(0);
+            DiskRef { id, path: dev.path.clone(), size_bytes }
+        }).collect();
+        disk_provenance.sort_by_key(|d| d.id);
+        let nvram_provenance = cfg.nvram.clone();
 
         // REX3 Graphics — skipped in headless mode
         let rex3: Option<Arc<Rex3>> = if cfg.headless {
@@ -318,9 +372,43 @@ impl Machine {
         // Connect HPC3 to System Memory (via Physical)
         hpc3.set_phys(phys.clone());
 
-        // Connect VINO to System Memory and start its DMA thread
+        // Connect VINO to System Memory, install a video source, start DMA.
+        // Source kind + broadcast standard come from `[vino]` in iris.toml.
         phys.vino.set_phys(phys.clone());
-        phys.vino.start();
+        let standard = match cfg.vino.standard {
+            crate::config::VinoStandard::Ntsc => crate::video_source::VideoStandard::Ntsc,
+            crate::config::VinoStandard::Pal  => crate::video_source::VideoStandard::Pal,
+        };
+        let source: Option<Arc<dyn crate::video_source::VideoSource>> = match cfg.vino.source {
+            crate::config::VinoSource::Camera => {
+                #[cfg(feature = "camera")]
+                {
+                    let idx = cfg.vino.camera_index;
+                    match crate::camera::CameraSource::new_with_index(standard, idx) {
+                        Ok(c)  => Some(Arc::new(c)),
+                        Err(e) => {
+                            eprintln!("VINO: camera {} unavailable ({}); using black source", idx, e);
+                            Some(Arc::new(crate::video_source::BlackSource::new(standard)))
+                        }
+                    }
+                }
+                #[cfg(not(feature = "camera"))]
+                {
+                    eprintln!("VINO: source=\"camera\" set but iris was built without --features camera; using test pattern");
+                    Some(Arc::new(crate::video_source::TestPatternSource::new(standard)))
+                }
+            }
+            crate::config::VinoSource::TestPattern =>
+                Some(Arc::new(crate::video_source::TestPatternSource::new(standard))),
+            crate::config::VinoSource::Black =>
+                Some(Arc::new(crate::video_source::BlackSource::new(standard))),
+            // Video-In disabled: no source, no DMA thread. VINO stays mapped.
+            crate::config::VinoSource::Off => None,
+        };
+        if let Some(source) = source {
+            phys.vino.set_source(source);
+            phys.vino.start();
+        }
 
         // 5. CPU config + TLB + Executor
         let cfg = MipsCpuConfig::indy();
@@ -410,6 +498,8 @@ impl Machine {
             last_restore: None,
             last_restore_checkpoint: None,
             scratch_path,
+            disks: disk_provenance,
+            nvram_path: nvram_provenance,
         }
     }
 
@@ -443,12 +533,10 @@ impl Machine {
         self.hpc3.start();
         if let Some(rex3) = &self._phys.rex3 { rex3.start(); }
 
-        // Monitor server on localhost:8888. Skipped in CI mode — the control
-        // socket replaces it, and binding a fixed port would prevent parallel
-        // `--ci` instances.
-        if self.ci_serial.is_none() {
-            self.monitor.clone().start_server("127.0.0.1:8888".to_string());
-        }
+        // Monitor server on localhost:8888 — always start, even in CI mode,
+        // so debug helpers (status/regs/bt/dis) stay reachable while iris-ci
+        // drives the serial console.
+        self.monitor.clone().start_server("127.0.0.1:8888".to_string());
 
         // CI mode: the harness drives startup via `restore` / `start`. Don't
         // autostart the CPU so the first command finds a quiet machine.
@@ -497,8 +585,13 @@ impl Machine {
                             MachineEvent::PowerOff => {
                                 println!("Machine: soft power-off");
                                 machine.stop();
+                                // Hosts that embed iris as a library (e.g. iris-gui)
+                                // set IRIS_NO_EXIT_ON_POWEROFF=1 so a guest halt
+                                // does not kill the host process.
                                 #[cfg(not(feature = "developer"))]
-                                std::process::exit(0);
+                                if std::env::var_os("IRIS_NO_EXIT_ON_POWEROFF").is_none() {
+                                    std::process::exit(0);
+                                }
                             }
                         }
                         Ok(())
@@ -560,6 +653,12 @@ impl Machine {
 
     pub fn get_ps2(&self) -> Arc<crate::ps2::Ps2Controller> {
         self.hpc3.ioc().ps2()
+    }
+
+    /// Borrow the HPC3 controller — used by CI socket commands that touch
+    /// RTC/SCSI directly (`rtc-save`, `cdrom-eject`).
+    pub fn hpc3(&self) -> &Hpc3 {
+        &self.hpc3
     }
 
     pub fn get_rex3(&self) -> Option<Arc<crate::rex3::Rex3>> {
@@ -807,6 +906,11 @@ impl Machine {
         // step crashes — the partial snapshot is at least diagnosable.
         let mut manifest = Manifest::for_current_save();
         manifest.parent = self.last_restore.clone();
+        // Provenance: which disks + nvram this state was captured against, so a
+        // later restore can refuse a mismatched base disk / build. (features are
+        // filled by for_current_save.)
+        manifest.disks = self.disks.clone();
+        manifest.nvram = Some(self.nvram_path.clone());
         snap.write_manifest(&manifest).map_err(|e| e.to_string())?;
         let sv = manifest.schema_version;
 
@@ -956,6 +1060,60 @@ impl Machine {
                         }
                     }
                 }
+
+                // Provenance validation: build features + disk presence/size = hard
+                // error; disk path and nvram = warn. IRIS_SNAPSHOT_SKIP_CHECK=1
+                // downgrades the hard errors to warnings.
+                let skip_check = std::env::var("IRIS_SNAPSHOT_SKIP_CHECK")
+                    .map(|v| v != "0" && !v.is_empty()).unwrap_or(false);
+                let mut fatal: Vec<String> = Vec::new();
+
+                if m.features.is_empty() && m.disks.is_empty() {
+                    eprintln!("load_snapshot: snapshot {} predates provenance recording — skipping disk/feature checks", name);
+                } else {
+                    // Build features must match exactly.
+                    let cur_features = enabled_features();
+                    if !m.features.is_empty() && m.features != cur_features {
+                        fatal.push(format!(
+                            "build features differ: snapshot [{}] vs current [{}]",
+                            m.features.join(","), cur_features.join(",")
+                        ));
+                    }
+                    // Every recorded disk must still be configured at the same SCSI
+                    // id with the same size. The host *path* is only where the file
+                    // happens to live (it moves when disks are relocated, e.g. into a
+                    // dist/ dir), so a path-only difference is a warning, not fatal —
+                    // a disk's identity for restore is its id + size, not its path.
+                    for d in &m.disks {
+                        match self.disks.iter().find(|c| c.id == d.id) {
+                            None => fatal.push(format!(
+                                "snapshot disk SCSI {} ('{}') is not configured in this run", d.id, d.path)),
+                            Some(cur) if cur.size_bytes != d.size_bytes => fatal.push(format!(
+                                "SCSI {} ('{}') size differs: snapshot {} bytes vs current {} bytes",
+                                d.id, d.path, d.size_bytes, cur.size_bytes)),
+                            Some(cur) if cur.path != d.path => eprintln!(
+                                "load_snapshot: SCSI {} path differs: snapshot '{}' vs current '{}' (same size — continuing)",
+                                d.id, d.path, cur.path),
+                            Some(_) => {}
+                        }
+                    }
+                    // nvram mismatch is non-fatal (eeprom state is in the snapshot).
+                    if let Some(nv) = &m.nvram {
+                        if nv != &self.nvram_path {
+                            eprintln!("load_snapshot: nvram differs: snapshot '{}' vs current '{}' (continuing)", nv, self.nvram_path);
+                        }
+                    }
+                }
+
+                if !fatal.is_empty() {
+                    let msg = format!("snapshot provenance mismatch:\n  - {}", fatal.join("\n  - "));
+                    if skip_check {
+                        eprintln!("load_snapshot: {} [IRIS_SNAPSHOT_SKIP_CHECK set — continuing anyway]", msg);
+                    } else {
+                        return Err(format!("{}\n(set IRIS_SNAPSHOT_SKIP_CHECK=1 to override)", msg));
+                    }
+                }
+
                 m.schema_version
             }
             None => {

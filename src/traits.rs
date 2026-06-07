@@ -80,6 +80,51 @@ pub trait BusDevice: Send + Sync {
     fn read64 (&self, _addr: u32) -> BusRead64 { BusRead64::err() }
     fn write64(&self, _addr: u32, _val: u64) -> u32 { BUS_ERR }
 
+    /// Return a pointer directly into the device's backing store at `addr`.
+    /// `addr` must be 8-byte aligned. The pointer is valid for the lifetime of `&self`.
+    /// Returns `None` for devices that do not support direct pointer access (default).
+    /// Data at the pointer is in the same layout as `read64` returns (host u64 chunks
+    /// with the two u32 halves swapped relative to native order — `rotate_left(32)`).
+    fn mem_ptr(&self, _addr: u32) -> Option<*const u64> {
+        None
+    }
+
+    /// Read `buf.len()` consecutive u64 chunks starting at `addr` into `buf`.
+    /// `addr` must be 8-byte aligned. Each u64 in `buf` is in the same byte
+    /// order as two consecutive `read32()` calls in big-endian (MIPS) word order:
+    /// `buf[i] = (read32(addr + i*8) as u64) << 32 | read32(addr + i*8 + 4) as u64`.
+    /// Returns BUS_OK on success or the first error status encountered.
+    /// Default: pairs of `read32` calls so devices that only implement 32-bit access work.
+    fn read_block(&self, addr: u32, buf: &mut [u64]) -> u32 {
+        let mut a = addr;
+        for slot in buf.iter_mut() {
+            let hi = self.read32(a);
+            if hi.status != BUS_OK { return hi.status; }
+            let lo = self.read32(a.wrapping_add(4));
+            if lo.status != BUS_OK { return lo.status; }
+            *slot = ((hi.data as u64) << 32) | lo.data as u64;
+            a = a.wrapping_add(8);
+        }
+        BUS_OK
+    }
+
+    /// Write `buf.len()` consecutive u64 chunks starting at `addr` from `buf`.
+    /// `addr` must be 8-byte aligned. Each u64 is split as two `write32` calls
+    /// in big-endian (MIPS) word order: high word first, then low word.
+    /// Returns BUS_OK on success or the first error status encountered.
+    /// Default: pairs of `write32` calls so devices that only implement 32-bit access work.
+    fn write_block(&self, addr: u32, buf: &[u64]) -> u32 {
+        let mut a = addr;
+        for &val in buf.iter() {
+            let s = self.write32(a, (val >> 32) as u32);
+            if s != BUS_OK { return s; }
+            let s = self.write32(a.wrapping_add(4), val as u32);
+            if s != BUS_OK { return s; }
+            a = a.wrapping_add(8);
+        }
+        BUS_OK
+    }
+
     /// Masked 64-bit write: only bytes where the corresponding mask byte is 0xFF are written.
     /// `addr` must be 8-byte aligned; `val` and `mask` are in big-endian (MIPS) byte order.
     /// Default: decompose into individual write8 calls for set bytes.

@@ -41,6 +41,10 @@ struct Ps2State {
     scanning_enabled: bool,
     mouse_enabled: bool,
     last_read: u8,
+    // Mouse mode: 0=standard, 3=IntelliMouse (wheel), 4=Explorer (wheel+5btn)
+    mouse_id: u8,
+    // Last two sample rates written, to detect knock sequences
+    sample_rate_history: [u8; 2],
 }
 
 /// Combined PS/2 Keyboard and Mouse Controller
@@ -65,6 +69,8 @@ impl Ps2Controller {
                 scanning_enabled: false,  // keyboard starts disabled; PROM enables via 0xF4
                 mouse_enabled: false,     // mouse starts disabled; PROM enables via 0xF4
                 last_read: 0xAA, // pretend we finished BAT at startup
+                mouse_id: 0,
+                sample_rate_history: [0, 0],
             }),
             callback,
             running: AtomicBool::new(false),
@@ -106,7 +112,22 @@ impl Ps2Controller {
         if state.next_write_is_mouse {
             if state.command_state == CommandState::MouseData {
                 if dbg { dlog!(LogModule::Ps2, "PS2: Mouse data <- {:02x}", val); }
+                dlog!(LogModule::Ps2, "PS2: Mouse Set Sample Rate value <- {:02x} (history: [{:02x}, {:02x}])",
+                    val, state.sample_rate_history[0], state.sample_rate_history[1]);
                 state.rx_queue.push_back((0xFA, Ps2Source::MouseCmd));
+                // Track sample rate history to detect knock sequences.
+                let prev = state.sample_rate_history[1];
+                state.sample_rate_history[1] = state.sample_rate_history[0];
+                state.sample_rate_history[0] = val;
+                // 200→100→80: standard→IntelliMouse (ID 0x03)
+                if prev == 200 && state.sample_rate_history[1] == 100 && val == 80 {
+                    state.mouse_id = 3;
+                    if dbg { dlog!(LogModule::Ps2, "PS2: IntelliMouse mode activated (ID=0x03)"); }
+                // 200→200→80: IntelliMouse→Explorer (ID 0x04), only if already 0x03
+                } else if prev == 200 && state.sample_rate_history[1] == 200 && val == 80 && state.mouse_id == 3 {
+                    state.mouse_id = 4;
+                    if dbg { dlog!(LogModule::Ps2, "PS2: IntelliMouse Explorer activated (ID=0x04)"); }
+                }
                 state.command_state = CommandState::Idle;
                 state.next_write_is_mouse = false;
             } else {
@@ -114,14 +135,22 @@ impl Ps2Controller {
                 match val {
                     0xFF => {
                         if dbg { dlog!(LogModule::Ps2, "PS2: Mouse Reset <- {:02x}", val); }
+                        if dbg { dlog!(LogModule::Ps2, "PS2: Mouse Reset (mouse_id={} -> 0)", state.mouse_id); }
                         state.mouse_enabled = false;
+                        state.mouse_id = 0;
+                        state.sample_rate_history = [0, 0];
                         state.rx_queue.push_back((0xAA, Ps2Source::MouseCmd)); // BAT Success
                         state.rx_queue.push_back((0x00, Ps2Source::MouseCmd)); // ID
                         state.next_write_is_mouse = false;
                     }
                     0xF6 => {
                         if dbg { dlog!(LogModule::Ps2, "PS2: Mouse Set Defaults <- {:02x}", val); }
+                        if dbg { dlog!(LogModule::Ps2, "PS2: Mouse Set Defaults (mouse_id={} preserved)", state.mouse_id); }
                         state.mouse_enabled = false;
+                        // 0xF6 resets operating params (rate, resolution, scaling) but not
+                        // the negotiated device mode — a real IntelliMouse stays in 4-byte
+                        // mode through Set Defaults. Only 0xFF (Reset) clears it.
+                        state.sample_rate_history = [0, 0];
                         state.next_write_is_mouse = false;
                     }
                     0xF5 => {
@@ -136,7 +165,9 @@ impl Ps2Controller {
                     }
                     0xF2 => {
                         if dbg { dlog!(LogModule::Ps2, "PS2: Mouse Read ID <- {:02x}", val); }
-                        state.rx_queue.push_back((0x00, Ps2Source::MouseCmd));
+                        let id = state.mouse_id;
+                        if dbg { dlog!(LogModule::Ps2, "PS2: Mouse Read ID -> 0x{:02x}", id); }
+                        state.rx_queue.push_back((id, Ps2Source::MouseCmd));
                         state.next_write_is_mouse = false;
                     }
                     0xF3 => {
@@ -712,68 +743,102 @@ impl Ps2Controller {
         }
     }
 
-    /// Push a byte to the mouse queue (called from UI)
-    pub fn push_mouse(&self, byte: u8) {
+    /// Push mouse input to the PS/2 queue.
+    ///
+    /// Encodes the inputs as a standard 3-byte PS/2 packet, or a 4-byte
+    /// IntelliMouse packet when that mode has been negotiated.
+    ///
+    /// - `buttons`: bits 0..4 = L, R, M, B4, B5
+    /// - `dx`, `dy`: signed X/Y delta (Y is screen-down-positive; flipped here)
+    /// - `dz`: scroll wheel delta (positive = scroll up/away from user)
+    pub fn push_mouse_input(&self, buttons: u8, dx: i32, dy: i32, dz: i32) {
         if !self.running.load(Ordering::Relaxed) { return; }
         let mut state = self.state.lock();
-        if !state.mouse_enabled {
-            return;
-        }
-        state.rx_queue.push_back((byte, Ps2Source::Mouse));
-        state.mouse_queue_bytes += 1;
-        drop(state);
-        if crate::devlog::devlog_is_active(LogModule::Ps2) {
-            dlog!(LogModule::Ps2, "PS2: Pushed Mouse byte {:02x}", byte);
-        }
-        self.update_interrupt();
-    }
+        if !state.mouse_enabled { return; }
 
-    /// Push a 3-byte mouse motion packet, coalescing into the tail when the
-    /// queue is congested (≥8 pending mouse packets) and the tail has the
-    /// same button state.
-    pub fn push_mouse_packet(&self, b0: u8, b1: u8, b2: u8) {
-        if !self.running.load(Ordering::Relaxed) { return; }
-        let mut state = self.state.lock();
-        if !state.mouse_enabled {
-            return;
-        }
-        let mouse_packets = state.mouse_queue_bytes / 3;
+        let ps2_dy = -dy; // PS/2 Y is up-positive
+        let sx = dx.clamp(-256, 255);
+        let sy = ps2_dy.clamp(-256, 255);
+
+        let mut b0 = 0x08u8 | (buttons & 0x07);
+        if sx < 0 { b0 |= 0x10; }
+        if sy < 0 { b0 |= 0x20; }
+        if dx < -256 || dx > 255 { b0 |= 0x40; }
+        if ps2_dy < -256 || ps2_dy > 255 { b0 |= 0x80; }
+
+        let mouse_id = state.mouse_id;
+        let packet_size = if mouse_id >= 3 { 4 } else { 3 };
+
+        // Coalesce into tail packet when queue is congested (≥8 pending packets)
+        // and the tail has the same button state.
+        let mouse_packets = state.mouse_queue_bytes / packet_size;
         let coalesced = if mouse_packets >= 8 {
             let len = state.rx_queue.len();
-            let i = len.wrapping_sub(3);
-            len >= 3
-                && matches!(state.rx_queue[i],     (_, Ps2Source::Mouse))
-                && matches!(state.rx_queue[i + 1], (_, Ps2Source::Mouse))
-                && matches!(state.rx_queue[i + 2], (_, Ps2Source::Mouse))
-                && (state.rx_queue[i].0 & 0x07) == (b0 & 0x07)
-                && {
-                    // Reconstruct 9-bit signed values from sign bit + data byte.
-                    let old_dx = if state.rx_queue[i].0 & 0x10 != 0 { state.rx_queue[i + 1].0 as i32 - 256 } else { state.rx_queue[i + 1].0 as i32 };
-                    let old_dy = if state.rx_queue[i].0 & 0x20 != 0 { state.rx_queue[i + 2].0 as i32 - 256 } else { state.rx_queue[i + 2].0 as i32 };
-                    let new_b1_signed = if b0 & 0x10 != 0 { b1 as i32 - 256 } else { b1 as i32 };
-                    let new_b2_signed = if b0 & 0x20 != 0 { b2 as i32 - 256 } else { b2 as i32 };
-                    let raw_dx = old_dx + new_b1_signed;
-                    let raw_dy = old_dy + new_b2_signed;
-                    let new_dx = raw_dx.clamp(-256, 255);
-                    let new_dy = raw_dy.clamp(-256, 255);
-                    let mut new_b0 = 0x08u8 | (b0 & 0x07);
-                    if new_dx < 0 { new_b0 |= 0x10; }
-                    if new_dy < 0 { new_b0 |= 0x20; }
-                    if raw_dx != new_dx { new_b0 |= 0x40; }
-                    if raw_dy != new_dy { new_b0 |= 0x80; }
-                    state.rx_queue[i].0     = new_b0;
-                    state.rx_queue[i + 1].0 = new_dx as u8;
-                    state.rx_queue[i + 2].0 = new_dy as u8;
-                    true
+            let tail = len.wrapping_sub(packet_size);
+            let tail_ok = len >= packet_size
+                && (0..packet_size).all(|j| matches!(state.rx_queue[tail + j], (_, Ps2Source::Mouse)))
+                && (state.rx_queue[tail].0 & 0x07) == (b0 & 0x07);
+            if tail_ok {
+                let old_dx = if state.rx_queue[tail].0 & 0x10 != 0 {
+                    state.rx_queue[tail + 1].0 as i32 - 256
+                } else {
+                    state.rx_queue[tail + 1].0 as i32
+                };
+                let old_dy = if state.rx_queue[tail].0 & 0x20 != 0 {
+                    state.rx_queue[tail + 2].0 as i32 - 256
+                } else {
+                    state.rx_queue[tail + 2].0 as i32
+                };
+                let raw_dx = old_dx + sx;
+                let raw_dy = old_dy + sy;
+                let new_dx = raw_dx.clamp(-256, 255);
+                let new_dy = raw_dy.clamp(-256, 255);
+                let mut new_b0 = 0x08u8 | (b0 & 0x07);
+                if new_dx < 0 { new_b0 |= 0x10; }
+                if new_dy < 0 { new_b0 |= 0x20; }
+                if raw_dx != new_dx { new_b0 |= 0x40; }
+                if raw_dy != new_dy { new_b0 |= 0x80; }
+                state.rx_queue[tail].0     = new_b0;
+                state.rx_queue[tail + 1].0 = new_dx as u8;
+                state.rx_queue[tail + 2].0 = new_dy as u8;
+                if mouse_id >= 3 {
+                    // Decode stored sign-extended nibble back to i8, accumulate, re-encode.
+                    let old_dz = (state.rx_queue[tail + 3].0 as i8) as i32;
+                    let new_dz = (old_dz + (-dz)).clamp(-8, 7) as i8 as u8;
+                    let new_dz = if new_dz & 0x08 != 0 { new_dz | 0xF0 } else { new_dz & 0x0F };
+                    state.rx_queue[tail + 3].0 = new_dz;
                 }
+                true
+            } else {
+                false
+            }
         } else {
             false
         };
+
         if !coalesced {
             state.rx_queue.push_back((b0, Ps2Source::Mouse));
-            state.rx_queue.push_back((b1, Ps2Source::Mouse));
-            state.rx_queue.push_back((b2, Ps2Source::Mouse));
-            state.mouse_queue_bytes += 3;
+            state.rx_queue.push_back((sx as u8, Ps2Source::Mouse));
+            state.rx_queue.push_back((sy as u8, Ps2Source::Mouse));
+            if mouse_id >= 3 {
+                // Byte 3: 4-bit signed scroll, sign-extended to 8 bits.
+                // Negate: our dz>0 = scroll up; PS/2 negative = scroll up.
+                // ID 0x03: bits [7:4] are pure sign extension, no button bits.
+                // ID 0x04: bits [4:5] = B4/B5, bits [6:7] = 0 (no sign extension).
+                let scroll_raw = (-dz).clamp(-8, 7) as i8 as u8;
+                let b3 = if mouse_id == 4 {
+                    // Explorer: scroll nibble only, no sign extension in upper bits
+                    (scroll_raw & 0x0F)
+                        | (if buttons & 0x08 != 0 { 0x10 } else { 0 })
+                        | (if buttons & 0x10 != 0 { 0x20 } else { 0 })
+                } else {
+                    // IntelliMouse: bits [7:4] sign-extend bit 3
+                    let nibble = scroll_raw & 0x0F;
+                    if nibble & 0x08 != 0 { nibble | 0xF0 } else { nibble }
+                };
+                state.rx_queue.push_back((b3, Ps2Source::Mouse));
+            }
+            state.mouse_queue_bytes += packet_size;
         }
         drop(state);
         self.update_interrupt();
@@ -792,7 +857,7 @@ impl Device for Ps2Controller {
     fn get_clock(&self) -> u64 { 0 }
 
     fn register_commands(&self) -> Vec<(String, String)> {
-        vec![("ps2".to_string(), "PS/2 commands: ps2 debug <on|off> [DEV]".to_string())]
+        vec![("ps2".to_string(), "PS/2 commands: ps2 debug <on|off> | ps2 type <ascii> | ps2 enter | ps2 status".to_string())]
     }
 
     fn execute_command(&self, cmd: &str, args: &[&str], mut writer: Box<dyn Write + Send>) -> Result<(), String> {
@@ -807,9 +872,74 @@ impl Device for Ps2Controller {
                 writeln!(writer, "PS/2 debug {}", if val { "enabled" } else { "disabled" }).unwrap();
                 return Ok(());
             }
-            return Err("Usage: ps2 debug <on|off>".to_string());
+            if !args.is_empty() && args[0] == "type" {
+                let text = args[1..].join(" ");
+                let mut n = 0usize;
+                for ch in text.chars() {
+                    if let Some((k, shifted)) = ascii_to_keycode(ch) {
+                        if shifted { self.push_kb(KeyCode::ShiftLeft, true); }
+                        self.push_kb(k, true);
+                        self.push_kb(k, false);
+                        if shifted { self.push_kb(KeyCode::ShiftLeft, false); }
+                        n += 1;
+                    }
+                }
+                writeln!(writer, "PS/2: typed {} chars", n).unwrap();
+                return Ok(());
+            }
+            if !args.is_empty() && args[0] == "enter" {
+                self.push_kb(KeyCode::Enter, true);
+                self.push_kb(KeyCode::Enter, false);
+                writeln!(writer, "PS/2: pressed Enter").unwrap();
+                return Ok(());
+            }
+            if !args.is_empty() && args[0] == "status" {
+                let s = self.state.lock();
+                writeln!(writer, "PS/2 state: running={} scanning_enabled={} mouse_enabled={} mouse_id={} rx_queue_len={} mouse_queue_bytes={} scancode_set={} config={:02x} last_read={:02x}",
+                    self.running.load(Ordering::Relaxed),
+                    s.scanning_enabled, s.mouse_enabled, s.mouse_id, s.rx_queue.len(),
+                    s.mouse_queue_bytes, s.scancode_set, s.config, s.last_read).unwrap();
+                return Ok(());
+            }
+            return Err("Usage: ps2 debug <on|off> | ps2 type <ascii> | ps2 enter | ps2 status".to_string());
         }
         Err("Command not found".to_string())
+    }
+}
+
+fn ascii_to_keycode(c: char) -> Option<(KeyCode, bool)> {
+    use KeyCode::*;
+    let unshifted = |k| Some((k, false));
+    let shifted   = |k| Some((k, true));
+    match c {
+        'a' => unshifted(KeyA), 'b' => unshifted(KeyB), 'c' => unshifted(KeyC), 'd' => unshifted(KeyD),
+        'e' => unshifted(KeyE), 'f' => unshifted(KeyF), 'g' => unshifted(KeyG), 'h' => unshifted(KeyH),
+        'i' => unshifted(KeyI), 'j' => unshifted(KeyJ), 'k' => unshifted(KeyK), 'l' => unshifted(KeyL),
+        'm' => unshifted(KeyM), 'n' => unshifted(KeyN), 'o' => unshifted(KeyO), 'p' => unshifted(KeyP),
+        'q' => unshifted(KeyQ), 'r' => unshifted(KeyR), 's' => unshifted(KeyS), 't' => unshifted(KeyT),
+        'u' => unshifted(KeyU), 'v' => unshifted(KeyV), 'w' => unshifted(KeyW), 'x' => unshifted(KeyX),
+        'y' => unshifted(KeyY), 'z' => unshifted(KeyZ),
+        'A' => shifted(KeyA), 'B' => shifted(KeyB), 'C' => shifted(KeyC), 'D' => shifted(KeyD),
+        'E' => shifted(KeyE), 'F' => shifted(KeyF), 'G' => shifted(KeyG), 'H' => shifted(KeyH),
+        'I' => shifted(KeyI), 'J' => shifted(KeyJ), 'K' => shifted(KeyK), 'L' => shifted(KeyL),
+        'M' => shifted(KeyM), 'N' => shifted(KeyN), 'O' => shifted(KeyO), 'P' => shifted(KeyP),
+        'Q' => shifted(KeyQ), 'R' => shifted(KeyR), 'S' => shifted(KeyS), 'T' => shifted(KeyT),
+        'U' => shifted(KeyU), 'V' => shifted(KeyV), 'W' => shifted(KeyW), 'X' => shifted(KeyX),
+        'Y' => shifted(KeyY), 'Z' => shifted(KeyZ),
+        '0' => unshifted(Digit0), '1' => unshifted(Digit1), '2' => unshifted(Digit2), '3' => unshifted(Digit3),
+        '4' => unshifted(Digit4), '5' => unshifted(Digit5), '6' => unshifted(Digit6), '7' => unshifted(Digit7),
+        '8' => unshifted(Digit8), '9' => unshifted(Digit9),
+        ' ' => unshifted(Space), '-' => unshifted(Minus), '=' => unshifted(Equal),
+        '/' => unshifted(Slash), '.' => unshifted(Period), ',' => unshifted(Comma),
+        ';' => unshifted(Semicolon),
+        '"' => shifted(Quote), '\'' => unshifted(Quote),
+        ':' => shifted(Semicolon),
+        '<' => shifted(Comma), '>' => shifted(Period), '?' => shifted(Slash),
+        '!' => shifted(Digit1), '@' => shifted(Digit2), '#' => shifted(Digit3),
+        '$' => shifted(Digit4), '%' => shifted(Digit5), '^' => shifted(Digit6),
+        '&' => shifted(Digit7), '*' => shifted(Digit8), '(' => shifted(Digit9),
+        ')' => shifted(Digit0), '_' => shifted(Minus), '+' => shifted(Equal),
+        _ => None,
     }
 }
 
@@ -826,6 +956,8 @@ impl Resettable for Ps2Controller {
         state.scanning_enabled = false;
         state.mouse_enabled = false;
         state.last_read = 0xAA;
+        state.mouse_id = 0;
+        state.sample_rate_history = [0, 0];
     }
 }
 
@@ -861,6 +993,11 @@ impl Saveable for Ps2Controller {
         tbl.insert("scanning_enabled".into(), toml::Value::Boolean(state.scanning_enabled));
         tbl.insert("mouse_enabled".into(), toml::Value::Boolean(state.mouse_enabled));
         tbl.insert("last_read".into(), hex_u8(state.last_read));
+        tbl.insert("mouse_id".into(), hex_u8(state.mouse_id));
+        tbl.insert("sample_rate_history".into(), toml::Value::Array(vec![
+            hex_u8(state.sample_rate_history[0]),
+            hex_u8(state.sample_rate_history[1]),
+        ]));
 
         toml::Value::Table(tbl)
     }
@@ -905,6 +1042,13 @@ impl Saveable for Ps2Controller {
         if let Some(x) = get_field(v, "scanning_enabled") { state.scanning_enabled = toml_bool(x).unwrap_or(false); }
         if let Some(x) = get_field(v, "mouse_enabled") { state.mouse_enabled = toml_bool(x).unwrap_or(false); }
         if let Some(x) = get_field(v, "last_read") { state.last_read = toml_u8(x).unwrap_or(0xAA); }
+        if let Some(x) = get_field(v, "mouse_id") { state.mouse_id = toml_u8(x).unwrap_or(0); }
+        if let Some(toml::Value::Array(arr)) = get_field(v, "sample_rate_history") {
+            if arr.len() == 2 {
+                state.sample_rate_history[0] = toml_u8(&arr[0]).unwrap_or(0);
+                state.sample_rate_history[1] = toml_u8(&arr[1]).unwrap_or(0);
+            }
+        }
 
         Ok(())
     }
